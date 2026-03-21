@@ -1,0 +1,357 @@
+10:22:18 [INFO] __main__: Loading data for 33 assets...
+10:22:19 [INFO] backtest.data_loader: Loaded 132 asset/TF combinations (33 assets), 13351041 total bars (640.8 MB est.)
+10:22:19 [INFO] __main__: Pre-computing scan features for all 33 assets (one-time)...
+10:22:19 [INFO] neo_flow.precompute_features: Pre-computing features for 28185 1h timestamps across 33 assets...
+/home/yagokhan/VaranusNeoFlow/Varanus_Extended_v1/neo_flow/precompute_features.py:229: RuntimeWarning: invalid value encountered in divide
+  pr = np.where(d > 1e-15, sum_dyx / d, 0.0)
+10:29:50 [INFO] neo_flow.precompute_features: Pre-computation complete: 451.1s, 33 assets, 42.8 MB
+10:29:50 [INFO] neo_flow.precompute_features: Saved features to /home/yagokhan/VaranusNeoFlow/Varanus_Extended_v1/data/features
+10:29:50 [INFO] __main__: === Group A [Majors]: 11 assets, 100 trials ===
+10:29:50 [INFO] __main__:   Optimizing on val 2024-04-29 → 2024-11-01 (FastBacktestEngine)
+10:29:51 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4371 scans, 485 trades
+10:29:52 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4365 scans, 1059 trades
+10:29:52 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4364 scans, 764 trades
+10:29:53 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4398 scans, 822 trades
+10:29:54 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4365 scans, 478 trades
+10:29:55 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4409 scans, 638 trades
+10:29:55 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4141 scans, 690 trades
+10:29:56 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4402 scans, 748 trades
+10:29:57 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4403 scans, 505 trades
+10:29:58 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4288 scans, 830 trades
+10:29:58 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4340 scans, 1004 trades
+10:29:59 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4384 scans, 922 trades
+10:30:00 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4369 scans, 865 trades
+10:30:01 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4269 scans, 881 trades
+10:30:01 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4412 scans, 977 trades
+10:30:02 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4378 scans, 842 trades
+10:30:03 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4357 scans, 1041 trades
+10:30:04 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4406 scans, 707 trades
+10:30:04 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4344 scans, 1142 trades
+10:30:05 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4313 scans, 807 trades
+10:30:06 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4375 scans, 778 trades
+10:30:07 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4354 scans, 1156 trades
+10:30:07 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4374 scans, 1080 trades
+10:30:08 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4368 scans, 1080 trades
+10:30:09 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4349 scans, 1029 trades
+10:30:10 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4364 scans, 1078 trades
+10:30:11 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4356 scans, 1047 trades
+10:30:11 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4344 scans, 1147 trades
+10:30:12 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4367 scans, 757 trades
+10:30:13 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4364 scans, 907 trades
+10:30:14 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4388 scans, 414 trades
+10:30:14 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4344 scans, 1147 trades
+10:30:15 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4361 scans, 1059 trades
+10:30:16 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4344 scans, 1143 trades
+10:30:17 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4356 scans, 1045 trades
+10:30:17 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4281 scans, 1016 trades
+10:30:18 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1034 trades
+10:30:19 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4347 scans, 1157 trades
+10:30:20 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4410 scans, 669 trades
+10:30:20 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4249 scans, 633 trades
+10:30:21 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4393 scans, 860 trades
+10:30:22 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4347 scans, 1157 trades
+10:30:23 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4323 scans, 1103 trades
+10:30:23 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4367 scans, 1077 trades
+10:30:24 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4368 scans, 1085 trades
+10:30:25 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:26 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:27 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:27 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:28 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:29 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:30 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:30 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:31 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:32 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4323 scans, 1124 trades
+10:30:33 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:33 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4323 scans, 1124 trades
+10:30:34 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4409 scans, 595 trades
+10:30:35 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4320 scans, 1108 trades
+10:30:36 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4258 scans, 819 trades
+10:30:36 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:37 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:38 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4333 scans, 1158 trades
+10:30:39 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4323 scans, 1124 trades
+10:30:40 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4366 scans, 1093 trades
+10:30:40 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4361 scans, 1072 trades
+10:30:41 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4353 scans, 1083 trades
+10:30:42 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4247 scans, 918 trades
+10:30:43 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4406 scans, 733 trades
+10:30:43 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4355 scans, 1067 trades
+10:30:44 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4323 scans, 1112 trades
+10:30:45 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:46 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:46 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:47 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4333 scans, 1158 trades
+10:30:48 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4380 scans, 953 trades
+10:30:49 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4364 scans, 1094 trades
+10:30:50 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4350 scans, 1178 trades
+10:30:50 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4350 scans, 1069 trades
+10:30:51 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4174 scans, 786 trades
+10:30:52 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4296 scans, 932 trades
+10:30:53 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:53 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1167 trades
+10:30:54 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4333 scans, 1158 trades
+10:30:55 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4333 scans, 1158 trades
+10:30:56 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4338 scans, 1145 trades
+10:30:56 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4342 scans, 1167 trades
+10:30:57 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4368 scans, 1096 trades
+10:30:58 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4342 scans, 1167 trades
+10:30:59 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4335 scans, 1143 trades
+10:30:59 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4359 scans, 1069 trades
+10:31:00 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4342 scans, 1167 trades
+10:31:01 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4342 scans, 1167 trades
+10:31:02 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4337 scans, 1158 trades
+10:31:03 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4342 scans, 1167 trades
+10:31:03 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4343 scans, 1158 trades
+10:31:04 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4335 scans, 1143 trades
+10:31:05 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4365 scans, 1101 trades
+10:31:06 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4355 scans, 873 trades
+10:31:06 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4379 scans, 943 trades
+10:31:06 [INFO] __main__:   Group A complete: 1.3 min, best score=13.2091
+10:31:06 [INFO] __main__:   Best params: {'min_confidence': 0.75, 'min_xgb_score': 0.45, 'trail_buffer': 0.3, 'min_pvt_r': 0.65, 'combined_gate': 0.8, 'hard_sl_mult': 3.25, 'exhaust_r': 0.45, 'pos_frac': 0.07}
+10:31:06 [INFO] __main__: === Group B [Tech & AI]: 11 assets, 100 trials ===
+10:31:06 [INFO] __main__:   Optimizing on val 2024-04-29 → 2024-11-01 (FastBacktestEngine)
+10:31:07 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4288 scans, 371 trades
+10:31:08 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4349 scans, 945 trades
+10:31:09 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4247 scans, 579 trades
+10:31:09 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4347 scans, 651 trades
+10:31:10 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4252 scans, 361 trades
+10:31:11 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4372 scans, 512 trades
+10:31:12 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4096 scans, 613 trades
+10:31:12 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4346 scans, 611 trades
+10:31:13 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4370 scans, 407 trades
+10:31:14 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4219 scans, 717 trades
+10:31:14 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4271 scans, 820 trades
+10:31:15 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4357 scans, 835 trades
+10:31:16 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4347 scans, 468 trades
+10:31:17 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4199 scans, 740 trades
+10:31:17 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4377 scans, 630 trades
+10:31:18 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4296 scans, 692 trades
+10:31:19 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4374 scans, 399 trades
+10:31:20 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 473 trades
+10:31:20 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4329 scans, 783 trades
+10:31:21 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4299 scans, 826 trades
+10:31:22 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4209 scans, 683 trades
+10:31:23 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4310 scans, 918 trades
+10:31:23 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4299 scans, 828 trades
+10:31:24 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4255 scans, 824 trades
+10:31:25 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4322 scans, 982 trades
+10:31:26 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4298 scans, 941 trades
+10:31:26 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4236 scans, 836 trades
+10:31:27 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4279 scans, 913 trades
+10:31:28 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4222 scans, 829 trades
+10:31:29 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4337 scans, 946 trades
+10:31:29 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4342 scans, 991 trades
+10:31:30 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4342 scans, 991 trades
+10:31:31 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4360 scans, 956 trades
+10:31:32 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4360 scans, 956 trades
+10:31:32 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4237 scans, 668 trades
+10:31:33 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4367 scans, 677 trades
+10:31:34 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4360 scans, 956 trades
+10:31:35 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4291 scans, 937 trades
+10:31:35 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4349 scans, 964 trades
+10:31:36 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4342 scans, 991 trades
+10:31:37 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4336 scans, 638 trades
+10:31:37 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4342 scans, 991 trades
+10:31:38 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4361 scans, 1045 trades
+10:31:39 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4351 scans, 954 trades
+10:31:40 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4349 scans, 1049 trades
+10:31:40 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4299 scans, 908 trades
+10:31:41 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4248 scans, 848 trades
+10:31:42 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4361 scans, 826 trades
+10:31:43 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4343 scans, 562 trades
+10:31:43 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4279 scans, 856 trades
+10:31:44 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4290 scans, 362 trades
+10:31:45 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4348 scans, 994 trades
+10:31:46 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4352 scans, 1022 trades
+10:31:46 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4349 scans, 1049 trades
+10:31:47 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4363 scans, 999 trades
+10:31:48 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4334 scans, 1004 trades
+10:31:49 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4356 scans, 979 trades
+10:31:49 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4337 scans, 1009 trades
+10:31:50 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4238 scans, 757 trades
+10:31:51 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4319 scans, 817 trades
+10:31:52 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4344 scans, 1031 trades
+10:31:52 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4344 scans, 1031 trades
+10:31:53 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4328 scans, 984 trades
+10:31:54 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4342 scans, 1029 trades
+10:31:55 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4334 scans, 1027 trades
+10:31:55 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4330 scans, 1025 trades
+10:31:56 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4303 scans, 947 trades
+10:31:57 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4329 scans, 1041 trades
+10:31:58 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4310 scans, 976 trades
+10:31:58 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4269 scans, 910 trades
+10:31:59 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4380 scans, 487 trades
+10:32:00 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4342 scans, 1029 trades
+10:32:00 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4319 scans, 968 trades
+10:32:01 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4319 scans, 968 trades
+10:32:02 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4279 scans, 926 trades
+10:32:03 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4313 scans, 941 trades
+10:32:03 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4338 scans, 923 trades
+10:32:04 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4310 scans, 976 trades
+10:32:05 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4330 scans, 960 trades
+10:32:06 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4314 scans, 945 trades
+10:32:06 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4209 scans, 823 trades
+10:32:07 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4319 scans, 968 trades
+10:32:08 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 992 trades
+10:32:09 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4340 scans, 1016 trades
+10:32:09 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4340 scans, 1016 trades
+10:32:10 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4347 scans, 943 trades
+10:32:11 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4340 scans, 1016 trades
+10:32:12 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4339 scans, 961 trades
+10:32:12 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 992 trades
+10:32:13 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4391 scans, 417 trades
+10:32:14 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4330 scans, 1022 trades
+10:32:15 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 992 trades
+10:32:15 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4340 scans, 1016 trades
+10:32:16 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4340 scans, 1016 trades
+10:32:17 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4340 scans, 1016 trades
+10:32:18 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4347 scans, 943 trades
+10:32:18 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 992 trades
+10:32:19 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4340 scans, 1013 trades
+10:32:20 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4367 scans, 670 trades
+10:32:21 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 989 trades
+10:32:21 [INFO] __main__:   Group B complete: 1.2 min, best score=12.1074
+10:32:21 [INFO] __main__:   Best params: {'min_confidence': 0.91, 'min_xgb_score': 0.55, 'trail_buffer': 0.35, 'min_pvt_r': 0.75, 'combined_gate': 0.85, 'hard_sl_mult': 2.5, 'exhaust_r': 0.55, 'pos_frac': 0.06}
+10:32:21 [INFO] __main__: === Group C [Momentum & Meme]: 11 assets, 100 trials ===
+10:32:21 [INFO] __main__:   Optimizing on val 2024-04-29 → 2024-11-01 (FastBacktestEngine)
+10:32:21 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4372 scans, 431 trades
+10:32:22 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4366 scans, 951 trades
+10:32:23 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4345 scans, 634 trades
+10:32:24 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4375 scans, 749 trades
+10:32:24 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4321 scans, 400 trades
+10:32:25 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4398 scans, 657 trades
+10:32:26 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4156 scans, 596 trades
+10:32:26 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4398 scans, 708 trades
+10:32:27 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4385 scans, 526 trades
+10:32:28 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4291 scans, 690 trades
+10:32:29 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4326 scans, 852 trades
+10:32:29 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4371 scans, 854 trades
+10:32:30 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 765 trades
+10:32:31 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4272 scans, 736 trades
+10:32:32 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4381 scans, 879 trades
+10:32:32 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4343 scans, 719 trades
+10:32:33 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4345 scans, 800 trades
+10:32:34 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4362 scans, 592 trades
+10:32:35 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4362 scans, 740 trades
+10:32:35 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4351 scans, 705 trades
+10:32:36 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4322 scans, 813 trades
+10:32:37 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4366 scans, 950 trades
+10:32:38 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4334 scans, 999 trades
+10:32:38 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4334 scans, 998 trades
+10:32:39 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4322 scans, 963 trades
+10:32:40 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4338 scans, 990 trades
+10:32:41 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4322 scans, 926 trades
+10:32:41 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4338 scans, 992 trades
+10:32:42 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4304 scans, 832 trades
+10:32:43 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4333 scans, 874 trades
+10:32:44 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4355 scans, 389 trades
+10:32:44 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4333 scans, 997 trades
+10:32:45 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4324 scans, 987 trades
+10:32:46 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4351 scans, 918 trades
+10:32:47 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4325 scans, 947 trades
+10:32:47 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4311 scans, 808 trades
+10:32:48 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 950 trades
+10:32:49 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4390 scans, 562 trades
+10:32:49 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4348 scans, 953 trades
+10:32:50 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4155 scans, 615 trades
+10:32:51 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4315 scans, 774 trades
+10:32:52 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4335 scans, 1024 trades
+10:32:52 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4305 scans, 980 trades
+10:32:53 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4331 scans, 974 trades
+10:32:54 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4351 scans, 926 trades
+10:32:55 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4328 scans, 956 trades
+10:32:55 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4405 scans, 662 trades
+10:32:56 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4352 scans, 700 trades
+10:32:57 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4353 scans, 954 trades
+10:32:58 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4335 scans, 970 trades
+10:32:58 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4309 scans, 787 trades
+10:32:59 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4335 scans, 970 trades
+10:33:00 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 953 trades
+10:33:01 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4341 scans, 997 trades
+10:33:01 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4335 scans, 967 trades
+10:33:02 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4343 scans, 879 trades
+10:33:03 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4335 scans, 935 trades
+10:33:04 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4358 scans, 829 trades
+10:33:04 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4364 scans, 950 trades
+10:33:05 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4391 scans, 677 trades
+10:33:06 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4330 scans, 920 trades
+10:33:07 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4334 scans, 999 trades
+10:33:07 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4335 scans, 970 trades
+10:33:08 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4345 scans, 1025 trades
+10:33:09 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4347 scans, 1018 trades
+10:33:10 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4364 scans, 950 trades
+10:33:10 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4366 scans, 948 trades
+10:33:11 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4364 scans, 952 trades
+10:33:12 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4333 scans, 1021 trades
+10:33:13 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4277 scans, 735 trades
+10:33:13 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4371 scans, 856 trades
+10:33:14 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4335 scans, 969 trades
+10:33:15 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4332 scans, 953 trades
+10:33:16 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4351 scans, 926 trades
+10:33:16 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4357 scans, 921 trades
+10:33:17 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4371 scans, 853 trades
+10:33:18 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4357 scans, 921 trades
+10:33:19 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4357 scans, 921 trades
+10:33:19 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4362 scans, 829 trades
+10:33:20 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4335 scans, 777 trades
+10:33:21 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4371 scans, 861 trades
+10:33:22 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4357 scans, 921 trades
+10:33:22 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4357 scans, 922 trades
+10:33:23 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4370 scans, 966 trades
+10:33:24 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4363 scans, 941 trades
+10:33:25 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4352 scans, 895 trades
+10:33:25 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4357 scans, 922 trades
+10:33:26 [INFO] backtest.engine_fast: FastBacktest complete: 0.8s, 4357 scans, 922 trades
+10:33:27 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4253 scans, 629 trades
+10:33:28 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4374 scans, 866 trades
+10:33:28 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4371 scans, 947 trades
+10:33:29 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4371 scans, 947 trades
+10:33:30 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4368 scans, 952 trades
+10:33:31 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4371 scans, 947 trades
+10:33:31 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4364 scans, 916 trades
+10:33:32 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4388 scans, 872 trades
+10:33:33 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4367 scans, 933 trades
+10:33:34 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4371 scans, 962 trades
+10:33:34 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4359 scans, 730 trades
+10:33:35 [INFO] backtest.engine_fast: FastBacktest complete: 0.7s, 4344 scans, 710 trades
+10:33:35 [INFO] __main__:   Group C complete: 1.2 min, best score=10.4356
+10:33:35 [INFO] __main__:   Best params: {'min_confidence': 0.84, 'min_xgb_score': 0.54, 'trail_buffer': 0.3, 'min_pvt_r': 0.8, 'combined_gate': 0.8, 'hard_sl_mult': 3.25, 'exhaust_r': 0.35, 'pos_frac': 0.07}
+10:33:35 [INFO] __main__: Optimized thresholds saved: /home/yagokhan/VaranusNeoFlow/Varanus_Extended_v1/config/optimized_thresholds.json
+
+================================================================================
+GROUP SWEEP RESULTS
+================================================================================
+
+  Group A [Majors]:
+           combined_gate: 0.8000
+               exhaust_r: 0.4500
+            hard_sl_mult: 3.2500
+          min_confidence: 0.7500
+               min_pvt_r: 0.6500
+           min_xgb_score: 0.4500
+                pos_frac: 0.0700
+            trail_buffer: 0.3000
+
+  Group B [Tech & AI]:
+           combined_gate: 0.8500
+               exhaust_r: 0.5500
+            hard_sl_mult: 2.5000
+          min_confidence: 0.9100
+               min_pvt_r: 0.7500
+           min_xgb_score: 0.5500
+                pos_frac: 0.0600
+            trail_buffer: 0.3500
+
+  Group C [Momentum & Meme]:
+           combined_gate: 0.8000
+               exhaust_r: 0.3500
+            hard_sl_mult: 3.2500
+          min_confidence: 0.8400
+               min_pvt_r: 0.8000
+           min_xgb_score: 0.5400
+                pos_frac: 0.0700
+            trail_buffer: 0.3000
+
+================================================================================

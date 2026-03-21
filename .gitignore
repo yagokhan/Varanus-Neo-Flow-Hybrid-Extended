@@ -1,0 +1,25 @@
+# Data files (too large for git)
+data/*.parquet
+data/features/*.npy
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Models (binary)
+models/*.json
+models/*.pkl
+
+# Environment
+.env
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/

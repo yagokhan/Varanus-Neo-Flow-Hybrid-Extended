@@ -1,0 +1,83 @@
+{
+  "description": "Varanus Neo-Flow Extended \u2014 Group-Specific Optimized Thresholds",
+  "groups": {
+    "A": {
+      "name": "Majors",
+      "assets": [
+        "BTC",
+        "ETH",
+        "SOL",
+        "BNB",
+        "XRP",
+        "ADA",
+        "LINK",
+        "DOT",
+        "LTC",
+        "BCH",
+        "TRX"
+      ],
+      "thresholds": {
+        "min_confidence": 0.75,
+        "min_xgb_score": 0.45,
+        "trail_buffer": 0.3,
+        "min_pvt_r": 0.65,
+        "combined_gate": 0.8,
+        "hard_sl_mult": 3.25,
+        "exhaust_r": 0.45,
+        "pos_frac": 0.07
+      }
+    },
+    "B": {
+      "name": "Tech & AI",
+      "assets": [
+        "FET",
+        "RENDER",
+        "NEAR",
+        "AR",
+        "GRT",
+        "INJ",
+        "THETA",
+        "FIL",
+        "ATOM",
+        "ICP",
+        "STX"
+      ],
+      "thresholds": {
+        "min_confidence": 0.91,
+        "min_xgb_score": 0.55,
+        "trail_buffer": 0.35,
+        "min_pvt_r": 0.75,
+        "combined_gate": 0.85,
+        "hard_sl_mult": 2.5,
+        "exhaust_r": 0.55,
+        "pos_frac": 0.06
+      }
+    },
+    "C": {
+      "name": "Momentum & Meme",
+      "assets": [
+        "PEPE",
+        "TIA",
+        "WIF",
+        "BONK",
+        "SUI",
+        "SEI",
+        "APT",
+        "SHIB",
+        "DOGE",
+        "FLOKI",
+        "OP"
+      ],
+      "thresholds": {
+        "min_confidence": 0.84,
+        "min_xgb_score": 0.54,
+        "trail_buffer": 0.3,
+        "min_pvt_r": 0.8,
+        "combined_gate": 0.8,
+        "hard_sl_mult": 3.25,
+        "exhaust_r": 0.35,
+        "pos_frac": 0.07
+      }
+    }
+  }
+}

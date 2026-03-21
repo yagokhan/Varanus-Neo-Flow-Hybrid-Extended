@@ -1,0 +1,157 @@
+{
+  "folds": [
+    {
+      "fold_id": 0,
+      "best_params": {
+        "min_pearson_r": 0.92,
+        "min_pvt_r": 0.5,
+        "combined_gate": 0.75,
+        "hard_sl_mult": 2.25,
+        "trail_buffer": 0.5,
+        "exhaust_r": 0.65,
+        "pos_frac": 0.03
+      },
+      "test_trades": 2003,
+      "test_win_rate": 65.00249625561658,
+      "test_sharpe": 9.243560886937335,
+      "test_max_dd": -12.928871220360003,
+      "test_pnl_pct": 485.2349883439839
+    },
+    {
+      "fold_id": 1,
+      "best_params": {
+        "min_pearson_r": 0.85,
+        "min_pvt_r": 0.65,
+        "combined_gate": 0.8,
+        "hard_sl_mult": 2.75,
+        "trail_buffer": 2.0,
+        "exhaust_r": 0.65,
+        "pos_frac": 0.03
+      },
+      "test_trades": 1110,
+      "test_win_rate": 46.846846846846844,
+      "test_sharpe": 4.734842076657888,
+      "test_max_dd": -18.005741589097344,
+      "test_pnl_pct": 284.7052331605128
+    },
+    {
+      "fold_id": 2,
+      "best_params": {
+        "min_pearson_r": 0.79,
+        "min_pvt_r": 0.85,
+        "combined_gate": 0.8,
+        "hard_sl_mult": 2.25,
+        "trail_buffer": 0.5,
+        "exhaust_r": 0.4,
+        "pos_frac": 0.03
+      },
+      "test_trades": 2440,
+      "test_win_rate": 62.6639344262295,
+      "test_sharpe": 13.667102202496999,
+      "test_max_dd": -8.626812557903607,
+      "test_pnl_pct": 612.0959762350025
+    },
+    {
+      "fold_id": 3,
+      "best_params": {
+        "min_pearson_r": 0.87,
+        "min_pvt_r": 0.85,
+        "combined_gate": 0.8,
+        "hard_sl_mult": 2.5,
+        "trail_buffer": 0.5,
+        "exhaust_r": 0.55,
+        "pos_frac": 0.03
+      },
+      "test_trades": 2443,
+      "test_win_rate": 64.46991404011462,
+      "test_sharpe": 14.18813895959221,
+      "test_max_dd": -5.518057648552025,
+      "test_pnl_pct": 708.8110176937308
+    },
+    {
+      "fold_id": 4,
+      "best_params": {
+        "min_pearson_r": 0.92,
+        "min_pvt_r": 0.65,
+        "combined_gate": 0.8,
+        "hard_sl_mult": 2.0,
+        "trail_buffer": 0.5,
+        "exhaust_r": 0.6000000000000001,
+        "pos_frac": 0.03
+      },
+      "test_trades": 2293,
+      "test_win_rate": 63.84648931530745,
+      "test_sharpe": 12.195289700366578,
+      "test_max_dd": -8.175525222499873,
+      "test_pnl_pct": 728.7575485433356
+    },
+    {
+      "fold_id": 5,
+      "best_params": {
+        "min_pearson_r": 0.92,
+        "min_pvt_r": 0.6,
+        "combined_gate": 0.8,
+        "hard_sl_mult": 3.0,
+        "trail_buffer": 0.5,
+        "exhaust_r": 0.4,
+        "pos_frac": 0.03
+      },
+      "test_trades": 2386,
+      "test_win_rate": 66.93210393964794,
+      "test_sharpe": 13.213813501304488,
+      "test_max_dd": -3.857608657129113,
+      "test_pnl_pct": 621.767389919375
+    },
+    {
+      "fold_id": 6,
+      "best_params": {
+        "min_pearson_r": 0.92,
+        "min_pvt_r": 0.8,
+        "combined_gate": 0.5,
+        "hard_sl_mult": 2.5,
+        "trail_buffer": 0.5,
+        "exhaust_r": 0.65,
+        "pos_frac": 0.03
+      },
+      "test_trades": 1333,
+      "test_win_rate": 65.19129782445611,
+      "test_sharpe": 7.042123718103272,
+      "test_max_dd": -10.211347396622203,
+      "test_pnl_pct": 267.5353628738776
+    },
+    {
+      "fold_id": 7,
+      "best_params": {
+        "min_pearson_r": 0.92,
+        "min_pvt_r": 0.65,
+        "combined_gate": 0.8,
+        "hard_sl_mult": 3.0,
+        "trail_buffer": 0.5,
+        "exhaust_r": 0.65,
+        "pos_frac": 0.03
+      },
+      "test_trades": 2270,
+      "test_win_rate": 67.9295154185022,
+      "test_sharpe": 10.722524144132825,
+      "test_max_dd": -8.05471052513978,
+      "test_pnl_pct": 514.0788364588237
+    }
+  ],
+  "consensus_params": {
+    "min_pearson_r": 0.92,
+    "min_pvt_r": 0.65,
+    "combined_gate": 0.8,
+    "hard_sl_mult": 2.5,
+    "trail_buffer": 0.5,
+    "exhaust_r": 0.625,
+    "pos_frac": 0.03
+  },
+  "blind_test": {
+    "trades": 1529,
+    "win_rate": 67.49509483322433,
+    "sharpe": 7.450488059047302,
+    "max_dd": -13.772140893017628,
+    "pnl_pct": 316.91044437381305,
+    "profit_factor": 2.48979404520715
+  }
+}

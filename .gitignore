@@ -8,3 +8,12 @@
 
 # pytest
 .pytest_cache/
+
+# Runtime
+__pycache__/
+*.pyc
+live_extended_bot.lock
+live_extended_state.json
+live_extended_trades.csv.backup_before_dedup
+logs/
+dashboard.log

@@ -34,7 +34,7 @@ BARS_7D = {"5m": 2016, "30m": 336, "1h": 168, "4h": 42}
 WFV_START = pd.Timestamp("2023-01-01", tz="UTC")
 WFV_END = pd.Timestamp("2025-10-31 23:00:00", tz="UTC")
 BLIND_START = pd.Timestamp("2025-11-01", tz="UTC")
-BLIND_END = pd.Timestamp("2026-03-20 06:00:00", tz="UTC")
+BLIND_END = pd.Timestamp("2026-03-21 20:00:00", tz="UTC")
 WFV_FOLDS = 8
 WFV_TRAIN_FRAC = 0.40
 WFV_VAL_FRAC = 0.30

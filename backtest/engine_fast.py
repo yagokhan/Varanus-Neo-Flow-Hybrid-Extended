@@ -35,6 +35,12 @@ from config.groups import get_group, get_thresholds, GroupThresholds
 
 logger = logging.getLogger(__name__)
 
+# ── Transaction Costs (Binance Futures realistic) ─────────────────────────────
+TAKER_FEE = 0.0004         # 0.04% per side
+SLIPPAGE_DEFAULT = 0.0002  # 0.02% per side (mid/large-cap)
+SLIPPAGE_VOLATILE = 0.0005 # 0.05% per side (meme/volatile coins)
+VOLATILE_ASSETS = {"PEPE", "BONK", "WIF", "FLOKI", "SHIB", "DOGE", "TIA", "SEI"}
+
 TF_FROM_IDX = {0: "5m", 1: "30m", 2: "1h", 3: "4h"}
 
 
@@ -115,6 +121,10 @@ class FastBacktestEngine:
         pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * pos.direction * 100.0
         pnl_pct_lev = pnl_pct * pos.leverage
         pnl_usd = pnl_pct_lev / 100.0 * pos.position_usd
+        # Transaction costs: fee + slippage, applied per side (entry + exit)
+        slip = SLIPPAGE_VOLATILE if pos.asset in VOLATILE_ASSETS else SLIPPAGE_DEFAULT
+        cost_usd = pos.position_usd * 2 * (TAKER_FEE + slip)
+        pnl_usd -= cost_usd
         self.realized_pnl += pnl_usd
 
         for tr in reversed(self.trades):

@@ -77,6 +77,7 @@ def main():
     parser.add_argument("--csv", action="store_true", help="Export trade log to CSV")
     parser.add_argument("--group", type=str, default=None, help="Single group (A/B/C)")
     parser.add_argument("--capital", type=float, default=10_000.0)
+    parser.add_argument("--no-xgb", action="store_true", help="Disable XGBoost meta-labeler filter")
     args = parser.parse_args()
 
     logger.info("Loading 33-asset dataset...")
@@ -101,6 +102,7 @@ def main():
     params = BacktestParams(
         initial_capital=args.capital,
         max_concurrent=8,
+        use_xgb=(not args.no_xgb),
         group_overrides=overrides,
     )
 

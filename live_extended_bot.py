@@ -54,6 +54,12 @@ from neo_flow.adaptive_engine import (
     compute_hard_sl,
     get_leverage,
     scan_asset,
+    find_best_regression,
+    get_htf_bias,
+    compute_pvt_regression,
+    check_pvt_alignment,
+    check_combined_gate,
+    trim_to_7d,
     HIGH_VOL_ASSETS,
 )
 
@@ -89,8 +95,8 @@ from ml.train_meta_model import (
 # Config & Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8686658919:AAH1ZGVg6xtl9q3tGzfBHDAyL1qyDkRrFzQ")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "443025840")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
@@ -159,7 +165,7 @@ def _load_consensus_params() -> dict:
 import logging.handlers
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s | %(levelname)-5s | %(message)s",
     handlers=[
         logging.StreamHandler(sys.stderr),
@@ -485,9 +491,29 @@ class LiveExtendedBot:
         self.live_mode = live_mode
         self.lock = threading.Lock()
         self.state = load_state()
-        if self.state.trade_counter == 0:
+        
+        # If live mode, sync initial_capital with actual Binance balance
+        if self.live_mode:
+            try:
+                ex = _get_exchange()
+                bal = ex.fetch_balance()
+                actual_bal = float(bal.get("USDT", {}).get("total", 0))
+                if actual_bal > 0:
+                    logger.info("Syncing state with Binance: Live Balance = $%.2f", actual_bal)
+                    # We reset realized_pnl to 0 and set initial_capital to actual balance 
+                    # so that Equity (initial + realized) matches reality on startup.
+                    self.state.initial_capital = actual_bal
+                    self.state.realized_pnl = 0.0
+                    if actual_bal > self.state.peak_equity:
+                        self.state.peak_equity = actual_bal
+                    save_state(self.state)
+            except Exception as e:
+                logger.error("Failed to sync balance with Binance: %s", e)
+
+        if self.state.trade_counter == 0 and not self.live_mode:
             self.state.initial_capital = initial_capital
             self.state.peak_equity = initial_capital
+        
         self.xgb_model, _ = load_model(XGB_MODEL_PATH)
         self.consensus = _load_consensus_params()
         self.group_thresholds = _load_group_thresholds()
@@ -732,9 +758,61 @@ class LiveExtendedBot:
                 scan_log["signals"].append({"asset": asset, "status": "no_data"})
                 continue
 
-            signal = scan_asset(asset, scan_dfs, df_4h)
+            # Step 1: Find best physics regression
+            best, all_results = find_best_regression(scan_dfs)
+            if not best:
+                scan_log["signals"].append({"asset": asset, "status": "no_regression"})
+                continue
+
+            abs_r = abs(best.pearson_r)
+            direction = 1 if best.slope < 0 else -1
+            
+            # Use thresholds for current asset's group
+            min_r = gt.min_confidence if gt else self.consensus["min_pearson_r"]
+
+            if abs_r < min_r:
+                # Still log a debug message even if below threshold
+                logger.debug("[%s][Grp%s] REJECTED R: |R|=%.4f < %.2f (%s P=%d)", 
+                            asset, group, abs_r, min_r, best.timeframe, best.period)
+                scan_log["signals"].append({"asset": asset, "status": "weak_r", "r": abs_r})
+                continue
+
+            # Step 2: PVT alignment
+            best_df_7d = trim_to_7d(scan_dfs[best.timeframe], best.timeframe)
+            pvt = compute_pvt_regression(best_df_7d, best.period)
+            min_pvt_r = gt.min_pvt_r if gt else self.consensus["min_pvt_r"]
+            pvt_passes, pvt_reason = check_pvt_alignment(direction, abs_r, pvt, min_pvt_r)
+            if not pvt_passes:
+                logger.debug("[%s][Grp%s] REJECTED PVT: %s", asset, group, pvt_reason)
+                scan_log["signals"].append({"asset": asset, "status": "pvt_rejected", "reason": pvt_reason})
+                continue
+
+            # Step 3: HTF bias
+            htf_bias = get_htf_bias(df_4h)
+            if htf_bias == 0:
+                logger.debug("[%s][Grp%s] REJECTED HTF: 4H bias neutral", asset, group)
+                scan_log["signals"].append({"asset": asset, "status": "htf_neutral"})
+                continue
+            if htf_bias != direction:
+                logger.debug("[%s][Grp%s] REJECTED HTF: conflict (sig=%d, htf=%d)", asset, group, direction, htf_bias)
+                scan_log["signals"].append({"asset": asset, "status": "htf_conflict"})
+                continue
+
+            # Step 4: Combined Gate
+            cg_thresh = gt.combined_gate if gt else self.consensus["combined_gate"]
+            if not check_combined_gate(direction, all_results, cg_thresh):
+                logger.debug("[%s][Grp%s] REJECTED GATE: opposing signal above %.2f", asset, group, cg_thresh)
+                scan_log["signals"].append({"asset": asset, "status": "combined_gate_blocked"})
+                continue
+
+            # If it reaches here, it passed physics
+            signal = scan_asset(asset, scan_dfs, df_4h, 
+                                min_pearson_r=min_r, min_pvt_r=min_pvt_r, 
+                                combined_gate_threshold=cg_thresh, group=group)
+            
             if not signal:
-                scan_log["signals"].append({"asset": asset, "status": "physics_rejected"})
+                # Should not happen if our manual checks passed, but for safety:
+                scan_log["signals"].append({"asset": asset, "status": "physics_rejected_final"})
                 continue
 
             # XGBoost Gate (group-specific threshold)
@@ -765,9 +843,13 @@ class LiveExtendedBot:
 
             hard_sl_mult = gt.hard_sl_mult if gt else self.consensus["hard_sl_mult"]
             hard_sl = compute_hard_sl(price, signal.atr, signal.direction, hard_sl_mult)
+            # Initial trail: Ensure it never starts above entry (for Long) or below entry (for Short)
             trail_buffer = gt.trail_buffer if gt else self.consensus["trail_buffer"]
             std_price = signal.midline * signal.std_dev
-            trail_sl = signal.midline - trail_buffer * std_price if signal.direction == 1 else signal.midline + trail_buffer * std_price
+            if signal.direction == 1:
+                trail_sl = min(price, signal.midline - trail_buffer * std_price)
+            else:
+                trail_sl = max(price, signal.midline + trail_buffer * std_price)
 
             quantity, order_id, sl_order_id = 0.0, "", ""
             if self.live_mode:
@@ -917,6 +999,8 @@ def start_price_monitor(bot: LiveExtendedBot):
         while True:
             try:
                 if bot.state.positions:
+                    n_pos = len(bot.state.positions)
+                    logger.debug("Monitor heartbeat: Checking %d positions", n_pos)
                     # Fetch prices outside lock (network I/O)
                     prices = {}
                     for asset, pos in list(bot.state.positions.items()):

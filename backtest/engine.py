@@ -38,8 +38,12 @@ from backtest.data_loader import (
 )
 
 from config.groups import get_group, get_thresholds, GroupThresholds
+from ml.train_meta_model import predict_probability, load_model
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+XGB_MODEL_PATH = Path(__file__).parent.parent / "models" / "meta_xgb.json"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -74,6 +78,7 @@ class BacktestParams:
     scan_interval_hours: int = 1
     # XGB threshold (per-group override via GroupThresholds)
     xgb_threshold: float = 0.55
+    use_xgb: bool = True          # New toggle
     # Group-specific overrides (None = use global defaults)
     group_overrides: dict | None = None
 
@@ -159,6 +164,19 @@ class BacktestEngine:
         self._trade_counter = 0
         self._scan_count = 0
         self._prev_1h_ns: int | None = None
+
+        # Load XGBoost model for realistic filtering
+        self.xgb_model = None
+        if self.params.use_xgb and XGB_MODEL_PATH.exists():
+            try:
+                self.xgb_model, _ = load_model(XGB_MODEL_PATH)
+                logger.info("Loaded XGBoost meta-labeler for backtest: %s", XGB_MODEL_PATH.name)
+            except Exception as e:
+                logger.error("Failed to load XGBoost model for backtest: %s", e)
+        elif not self.params.use_xgb:
+            logger.info("XGBoost disabled by params (PHYSICS-ONLY mode).")
+        else:
+            logger.warning("XGBoost model not found at %s. Backtest will be PHYSICS-ONLY.", XGB_MODEL_PATH)
 
     def _get_group_thresholds(self, asset: str) -> GroupThresholds:
         """Get group-specific thresholds, with param overrides applied."""
@@ -283,6 +301,23 @@ class BacktestEngine:
             if signal is None:
                 continue
 
+            # ML Meta-Labeler Filter (MATCH LIVE BOT)
+            if self.xgb_model is not None:
+                try:
+                    xgb_prob = predict_probability(
+                        self.xgb_model,
+                        confidence=signal.confidence,
+                        pvt_r=signal.pvt_r,
+                        best_tf=signal.best_tf,
+                        best_period=signal.best_period,
+                    )
+                    # Use group-specific threshold if provided
+                    threshold = gt.min_xgb_score
+                    if xgb_prob < threshold:
+                        continue
+                except Exception as e:
+                    logger.error("XGB prediction failed in backtest: %s", e)
+
             # Entry at next bar open on signal's TF
             ad = asset_data.get(signal.best_tf)
             if ad is None:
@@ -318,9 +353,9 @@ class BacktestEngine:
             # Initial trail
             std_dev_price = signal.midline * signal.std_dev
             if signal.direction == 1:
-                initial_trail = signal.midline - gt.trail_buffer * std_dev_price
+                initial_trail = min(entry_price, signal.midline - gt.trail_buffer * std_dev_price)
             else:
-                initial_trail = signal.midline + gt.trail_buffer * std_dev_price
+                initial_trail = max(entry_price, signal.midline + gt.trail_buffer * std_dev_price)
 
             self._trade_counter += 1
             entry_ts = current_ts

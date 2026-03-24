@@ -49,7 +49,7 @@ TF_MS = {
 }
 
 GLOBAL_START = datetime(2023, 1, 1, tzinfo=timezone.utc)
-GLOBAL_END   = datetime(2026, 3, 21, 13, 0, 0, tzinfo=timezone.utc)
+GLOBAL_END   = datetime(2026, 3, 24, 23, 59, 59, tzinfo=timezone.utc)
 
 KLINES_URL  = "https://fapi.binance.com/fapi/v1/klines"    # Futures endpoint
 SPOT_URL    = "https://api.binance.com/api/v3/klines"       # Spot fallback

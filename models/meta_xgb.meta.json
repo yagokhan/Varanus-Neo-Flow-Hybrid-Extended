@@ -1,0 +1,33 @@
+{
+  "model_type": "xgboost_meta_labeler_extended",
+  "feature_columns": [
+    "confidence",
+    "pvt_r",
+    "best_tf_encoded",
+    "best_period"
+  ],
+  "tf_encoding": {
+    "5m": 0,
+    "30m": 1,
+    "1h": 2,
+    "4h": 3
+  },
+  "source_files": [
+    "extended_trades.csv",
+    "blind_test_trades.csv"
+  ],
+  "cv_metrics": {
+    "n_samples": 4123,
+    "n_positive": 3082,
+    "positive_rate": 0.7475,
+    "mean_auc": 0.6771,
+    "std_auc": 0.0183,
+    "mean_accuracy": 0.6762,
+    "feature_importance": {
+      "confidence": 0.1566,
+      "pvt_r": 0.1615,
+      "best_tf_encoded": 0.5335,
+      "best_period": 0.1484
+    }
+  }
+}

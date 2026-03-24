@@ -50,6 +50,11 @@ class HybridParams(BacktestParams):
     xgb_threshold: float = 0.55
 
 
+# ── Transaction Costs (Binance Futures realistic) ─────────────────────────────
+TAKER_FEE = 0.0004         # 0.04% per side
+SLIPPAGE_DEFAULT = 0.0002  # 0.02% per side
+
+
 class NeoFlowHybridEngine:
     """
     Extended Hybrid Engine: Physics + XGBoost meta-labeler with group-aware thresholds.
@@ -98,18 +103,22 @@ class NeoFlowHybridEngine:
         return self.features[asset][idx]
 
     def _get_entry_price(self, asset, tf, signal_ns):
+        """Entry at next bar's open (realistic — cannot know current bar's close)."""
         ad = self.all_data.get(asset, {}).get(tf)
         if ad is None:
             return None
-        idx = np.searchsorted(ad.timestamps, signal_ns, side="right") - 1
-        if idx < 0:
+        idx = np.searchsorted(ad.timestamps, signal_ns, side="right")
+        if idx >= len(ad.timestamps):
             return None
-        return float(ad.close[idx])
+        return float(ad.open_[idx])
 
     def _close_position(self, pos, exit_price, exit_ts, exit_reason):
         pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * pos.direction * 100.0
         pnl_pct_lev = pnl_pct * pos.leverage
         pnl_usd = pnl_pct_lev / 100.0 * pos.position_usd
+        # Transaction costs: fee + slippage, applied per side (entry + exit)
+        cost_usd = pos.position_usd * 2 * (TAKER_FEE + SLIPPAGE_DEFAULT)
+        pnl_usd -= cost_usd
         self.realized_pnl += pnl_usd
         for tr in reversed(self.trades):
             if tr.trade_id == pos.trade_id:

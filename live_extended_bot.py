@@ -37,6 +37,7 @@ from dataclasses import dataclass, field, asdict
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import websocket
 from dotenv import load_dotenv
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -76,6 +77,8 @@ from backtest.data_loader import (
 
 from config.groups import (
     ALL_ASSETS,
+    ALL_SYMBOLS,
+    ASSET_FROM_SYMBOL,
     ASSET_TO_GROUP,
     GROUP_NAMES,
     GroupThresholds,
@@ -302,6 +305,28 @@ def get_live_data():
                 if len(ad.close) < needed:
                     logger.warning("DATA GAP: %s %s has %d/%d bars", asset, tf, len(ad.close), needed)
     return _cached_data
+
+def _append_ws_bar_to_cache(asset: str, open_: float, high: float, low: float,
+                            close: float, volume: float, ts_ms: int):
+    """Append a single closed 5m bar from websocket to the in-memory cache."""
+    global _cached_data
+    if _cached_data is None:
+        return
+    ad = _cached_data.get(asset, {}).get("5m")
+    if ad is None:
+        return
+    ts_ns = int(ts_ms * 1_000_000)
+    # Skip if we already have this bar
+    if ts_ns <= ad.timestamps[-1]:
+        return
+    ad.close = np.append(ad.close, close)
+    ad.high = np.append(ad.high, high)
+    ad.low = np.append(ad.low, low)
+    ad.open_ = np.append(ad.open_, open_)
+    ad.volume = np.append(ad.volume, volume)
+    ad.timestamps = np.append(ad.timestamps, ts_ns)
+    ad.pvt = _compute_pvt(ad.close, ad.volume)
+
 
 def fetch_ticker_price(symbol: str) -> float | None:
     try:
@@ -651,6 +676,13 @@ class LiveExtendedBot:
         completed_cutoff = now_ns - (15 * 10**9)
 
         for asset, pos in list(self.state.positions.items()):
+            asset_cache = _cached_data.get(asset, {})
+            ad = asset_cache.get(pos.best_tf)
+            if ad is None:
+                continue
+            
+            gt = self.group_thresholds.get(pos.group)
+            
             mask = (ad.timestamps > pos.last_bar_ns) & (ad.timestamps <= completed_cutoff)
             indices = np.where(mask)[0]
 
@@ -957,6 +989,53 @@ class LiveExtendedBot:
         tg_send("\n".join(lines))
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Websocket Engine (Real-Time Alignment)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def start_websocket_stream(bot: "LiveExtendedBot"):
+    """Listen to Binance Futures Kline streams for real-time bar updates."""
+    import json
+    from websocket import WebSocketApp
+
+    def on_message(ws, message):
+        try:
+            data = json.loads(message)
+            k = data.get("k", {})
+            # Only process if bar is CLOSED
+            if k.get("x"):
+                asset = data["s"].replace("USDT", "")
+                _append_ws_bar_to_cache(
+                    asset=asset,
+                    open_=float(k["o"]),
+                    high=float(k["h"]),
+                    low=float(k["l"]),
+                    close=float(k["c"]),
+                    volume=float(k["v"]),
+                    ts_ms=int(k["t"])
+                )
+                logger.debug("WS BAR RECEIVED: %s %s @ %.4f", asset, k["i"], float(k["c"]))
+        except Exception as e:
+            logger.error("Websocket message error: %s", e)
+
+    def on_error(ws, error):
+        logger.error("Websocket error: %s", error)
+
+    def on_close(ws, close_status_code, close_msg):
+        logger.warning("Websocket closed. Reconnecting...")
+        time.sleep(5)
+        _run_ws()
+
+    def _run_ws():
+        # Build stream names for 5m timeframes only (used for sub-bar exits)
+        streams = [f"{s.lower()}@kline_5m" for s in ALL_SYMBOLS]
+        stream_url = f"wss://fstream.binance.com/ws/{'/'.join(streams)}"
+        ws = WebSocketApp(stream_url, on_message=on_message, on_error=on_error, on_close=on_close)
+        ws.run_forever()
+
+    threading.Thread(target=_run_ws, daemon=True).start()
+    logger.info("Websocket stream started for 33 assets (5m interval)")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Threads: Command Listener & Price Monitor
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1091,6 +1170,7 @@ def main():
 
     start_telegram_listener(bot)
     start_price_monitor(bot)
+    start_websocket_stream(bot)
 
     stop_event = threading.Event()
     def _shutdown(s, f):

@@ -647,18 +647,10 @@ class LiveExtendedBot:
         if _cached_data is None:
             return
         now_ns = int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
-        TF_NS = {"5m": 300 * 10**9, "30m": 1800 * 10**9, "1h": 3600 * 10**9, "4h": 14400 * 10**9}
+        # 15s settlement buffer for all timeframes (ensures data stability)
+        completed_cutoff = now_ns - (15 * 10**9)
 
         for asset, pos in list(self.state.positions.items()):
-            if asset not in self.state.positions:
-                continue
-            ad = _cached_data.get(asset, {}).get(pos.best_tf)
-            if ad is None:
-                continue
-
-            gt = self.group_thresholds.get(pos.group, DEFAULT_THRESHOLDS.get(pos.group))
-            tf_ns = TF_NS.get(pos.best_tf, 3600 * 10**9)
-            completed_cutoff = now_ns - tf_ns
             mask = (ad.timestamps > pos.last_bar_ns) & (ad.timestamps <= completed_cutoff)
             indices = np.where(mask)[0]
 
@@ -1113,9 +1105,9 @@ def main():
         return
 
     now = datetime.now(timezone.utc)
-    next_trigger = now.replace(minute=0, second=1, microsecond=0) + timedelta(hours=1)
+    next_trigger = now.replace(minute=1, second=0, microsecond=0) + timedelta(hours=1)
     wait_secs = int((next_trigger - now).total_seconds())
-    logger.info("Waiting for next top-of-hour scan: %s UTC (%d min %d sec)",
+    logger.info("Waiting for next top-of-hour scan (60s settlement): %s UTC (%d min %d sec)",
                 next_trigger.strftime("%H:%M"), wait_secs // 60, wait_secs % 60)
     tg_send(
         f"<b>Extended Bot Started</b> — {now.strftime('%H:%M UTC')}\n"
@@ -1129,7 +1121,7 @@ def main():
     last_cycle_hour = -1  # track last executed hour to prevent double execution
     while not stop_event.is_set():
         now = datetime.now(timezone.utc)
-        next_trigger = now.replace(minute=0, second=1, microsecond=0) + timedelta(hours=1)
+        next_trigger = now.replace(minute=1, second=0, microsecond=0) + timedelta(hours=1)
         sleep_secs = max(1, int((next_trigger - now).total_seconds()))
         stop_event.wait(timeout=sleep_secs)  # wakes immediately on SIGTERM/SIGINT
         if stop_event.is_set():

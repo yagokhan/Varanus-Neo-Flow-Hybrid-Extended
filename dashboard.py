@@ -554,6 +554,45 @@ def _find_best_period(close_arr: np.ndarray) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Live Ticker Bridge (Websocket)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LiveTickerBridge:
+    """Singleton bridge to store latest ticker prices from a background thread."""
+    _instance = None
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(LiveTickerBridge, cls).__new__(cls)
+            cls._instance.prices = {}
+            cls._instance.last_update = 0
+            cls._instance._start_thread()
+        return cls._instance
+
+    def _start_thread(self):
+        import threading
+        def _run():
+            import json
+            from websocket import WebSocketApp
+            def on_message(ws, msg):
+                try:
+                    data = json.loads(msg)
+                    symbol = data["s"]
+                    price = float(data["c"])
+                    self.prices[symbol] = price
+                    self.last_update = time.time()
+                except: pass
+            
+            streams = [f"{s.lower()}@ticker" for s in ALL_ASSETS]
+            url = f"wss://fstream.binance.com/ws/{'/'.join(streams)}"
+            ws = WebSocketApp(url, on_message=on_message)
+            ws.run_forever()
+        
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+TICKER_BRIDGE = LiveTickerBridge()
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1: Cockpit
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -690,16 +729,24 @@ def render_cockpit(state: dict, prices: dict):
 
 def render_intelligence(state: dict, scan_log: dict):
     now = datetime.now(timezone.utc)
-    next_scan = now.replace(minute=0, second=1, microsecond=0) + timedelta(hours=1)
-    remaining = next_scan - now
-    mins = int(remaining.total_seconds()) // 60
-    secs = int(remaining.total_seconds()) % 60
+
+    # WebSocket Gear: 5-minute intervals
+    next_5m = (now + timedelta(minutes=5)).replace(second=0, microsecond=0)
+    next_5m = next_5m.replace(minute=(next_5m.minute // 5) * 5)
+    rem_5m = (next_5m - now).total_seconds()
+    m5, s5 = int(rem_5m // 60), int(rem_5m % 60)
+
+    # Hourly Gear: Audit cycle
+    next_1h = now.replace(minute=1, second=0, microsecond=0)
+    if next_1h <= now:
+        next_1h += timedelta(hours=1)
+    rem_1h = (next_1h - now).total_seconds()
+    m1h, s1h = int(rem_1h // 60), int(rem_1h % 60)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Next Scan In", f"{mins:02d}:{secs:02d}")
-    c2.metric("Last Scan", time_since(state.get("last_scan_ts", "")))
-    c3.metric("Scan #", f"{state.get('total_scans', 0)}")
-
+    c1.metric("Next 5m Scan", f"{m5:02d}:{s5:02d}", delta="WS stream active")
+    c2.metric("Last Activity", time_since(state.get("last_scan_ts", "")))
+    c3.metric("Next Audit (1h)", f"{m1h:02d}:{s1h:02d}")
     st.markdown("---")
 
     # Group filter
@@ -961,6 +1008,7 @@ def _render_bot_scan_log(scan_log: dict):
                 "entered": "#00d97e", "xgb_rejected": "#f6c343",
                 "physics_rejected": "#e63757", "in_position": "#39afd1",
                 "just_closed": "#888", "no_data": "#555", "max_positions": "#888",
+                "scanning": "#39afd1",
             }
             rows_html = ""
             for s in signals:
@@ -1013,8 +1061,7 @@ def _render_bot_scan_log(scan_log: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render_charting(state: dict, trades_df: pd.DataFrame):
-    st.caption("Interactive charts with regression channel, trailing stop, and ML sentiment.")
-
+    # Live Ticker Integration
     positions = state.get("positions", {})
     open_assets = list(positions.keys())
     other_assets = [a for a in ASSETS if a not in open_assets]
@@ -1027,12 +1074,18 @@ def render_charting(state: dict, trades_df: pd.DataFrame):
             asset_list,
             format_func=lambda a: f"{a} [{get_group(a)}] {'(OPEN)' if a in positions else ''}",
         )
+    
+    # Get Live Price from WebSocket Bridge
+    ws_price = TICKER_BRIDGE.prices.get(f"{selected_asset}USDT", 0)
+    
     with col_tf:
         selected_tf = st.selectbox("Timeframe", SCAN_TIMEFRAMES, index=2)
     with col_grp:
         if selected_asset:
-            g = get_group(selected_asset)
-            st.markdown(f"**Group {g}** — {GROUP_LABELS.get(g, '')}")
+            if ws_price > 0:
+                st.markdown(f"**Live Price: `${ws_price:.4f}`** :signal_strength:")
+            else:
+                st.markdown(f"**Group {get_group(selected_asset)}**")
 
     if not selected_asset:
         return
@@ -1044,6 +1097,14 @@ def render_charting(state: dict, trades_df: pd.DataFrame):
     if df_candles.empty:
         st.error(f"Failed to fetch candle data for {symbol}")
         return
+
+    # Update latest candle with WebSocket price for real-time feel
+    if ws_price > 0:
+        df_candles.iloc[-1, df_candles.columns.get_loc("close")] = ws_price
+        if ws_price > df_candles.iloc[-1]["high"]:
+            df_candles.iloc[-1, df_candles.columns.get_loc("high")] = ws_price
+        if ws_price < df_candles.iloc[-1]["low"]:
+            df_candles.iloc[-1, df_candles.columns.get_loc("low")] = ws_price
 
     close_arr = df_candles["close"].values.astype(np.float64)
 
@@ -1631,6 +1692,7 @@ def main():
 
         if pid:
             st.markdown(":green_circle: **Bot Running**")
+            st.markdown(":antenna_bars: **Data Sync: Websocket**")
         else:
             st.markdown(":red_circle: **Bot Stopped**")
         if state.get("circuit_breaker"):
@@ -1680,6 +1742,14 @@ def main():
         render_trade_history(trades_df)
     with tab6:
         render_controls(state)
+
+    # Sidebar Footer / Auto-Refresh
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+    do_refresh = st.sidebar.checkbox("Auto Refresh (30s)", value=True)
+    if do_refresh:
+        time.sleep(30)
+        st.rerun()
 
 
 if __name__ == "__main__":

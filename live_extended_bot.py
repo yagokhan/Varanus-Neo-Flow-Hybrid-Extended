@@ -75,6 +75,8 @@ from backtest.data_loader import (
     TIMEFRAMES,
 )
 
+from backtest.engine import BacktestEngine, BacktestParams
+
 from config.groups import (
     ALL_ASSETS,
     ALL_SYMBOLS,
@@ -186,16 +188,30 @@ for name in ["urllib3", "ccxt", "httpx", "httpcore", "telegram"]:
 # Telegram Helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _tg_escape(text: str) -> str:
+    """Escape HTML special chars OUTSIDE of <b> tags."""
+    import re
+    # Extract <b>...</b> tags, escape everything else, then restore tags
+    parts = re.split(r'(<b>.*?</b>)', text)
+    result = []
+    for p in parts:
+        if p.startswith('<b>') and p.endswith('</b>'):
+            result.append(p)
+        else:
+            result.append(p.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+    return ''.join(result)
+
 def tg_send(text: str, parse_mode: str = "HTML"):
     """Send a Telegram message. Non-blocking, swallows errors."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram not configured — skipping notification")
         return
     try:
+        safe_text = _tg_escape(text) if parse_mode == "HTML" else text
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         resp = _requests.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
+            "text": safe_text,
             "parse_mode": parse_mode,
         }, timeout=10)
         resp.raise_for_status()
@@ -753,11 +769,13 @@ class LiveExtendedBot:
 
     def _scan_and_enter(self, all_data: dict, skip_assets: set):
         if len(self.state.positions) >= MAX_CONCURRENT:
-            return
+            return [], []
         now = datetime.now(timezone.utc)
         scan_ns = int(now.replace(minute=0, second=0, microsecond=0).timestamp() * 1_000_000_000)
         scan_log = {"timestamp": now.isoformat(), "scan_number": self.state.total_scans,
                      "signals": []}
+        near_misses = []   # signals that passed R-gate but failed later
+        entries = []       # signals that resulted in a trade
         for asset in ASSETS:
             if asset in self.state.positions or asset in skip_assets:
                 scan_log["signals"].append({"asset": asset, "status": "in_position" if asset in self.state.positions else "just_closed"})
@@ -806,9 +824,16 @@ class LiveExtendedBot:
             pvt = compute_pvt_regression(best_df_7d, best.period)
             min_pvt_r = gt.min_pvt_r if gt else self.consensus["min_pvt_r"]
             pvt_passes, pvt_reason = check_pvt_alignment(direction, abs_r, pvt, min_pvt_r)
+            pvt_r_val = abs(pvt.pearson_r) if pvt else 0.0
+            dir_str = "LONG" if direction == 1 else "SHORT"
             if not pvt_passes:
                 logger.debug("[%s][Grp%s] REJECTED PVT: %s", asset, group, pvt_reason)
                 scan_log["signals"].append({"asset": asset, "status": "pvt_rejected", "reason": pvt_reason})
+                near_misses.append({
+                    "asset": asset, "group": group, "dir": dir_str,
+                    "r": abs_r, "pvt_r": pvt_r_val, "tf": best.timeframe, "period": best.period,
+                    "rejected_at": "PVT", "detail": pvt_reason,
+                })
                 continue
 
             # Step 3: HTF bias
@@ -816,10 +841,20 @@ class LiveExtendedBot:
             if htf_bias == 0:
                 logger.debug("[%s][Grp%s] REJECTED HTF: 4H bias neutral", asset, group)
                 scan_log["signals"].append({"asset": asset, "status": "htf_neutral"})
+                near_misses.append({
+                    "asset": asset, "group": group, "dir": dir_str,
+                    "r": abs_r, "pvt_r": pvt_r_val, "tf": best.timeframe, "period": best.period,
+                    "rejected_at": "HTF", "detail": "4H neutral",
+                })
                 continue
             if htf_bias != direction:
                 logger.debug("[%s][Grp%s] REJECTED HTF: conflict (sig=%d, htf=%d)", asset, group, direction, htf_bias)
                 scan_log["signals"].append({"asset": asset, "status": "htf_conflict"})
+                near_misses.append({
+                    "asset": asset, "group": group, "dir": dir_str,
+                    "r": abs_r, "pvt_r": pvt_r_val, "tf": best.timeframe, "period": best.period,
+                    "rejected_at": "HTF", "detail": f"conflict (sig={direction}, htf={htf_bias})",
+                })
                 continue
 
             # Step 4: Combined Gate
@@ -827,6 +862,11 @@ class LiveExtendedBot:
             if not check_combined_gate(direction, all_results, cg_thresh):
                 logger.debug("[%s][Grp%s] REJECTED GATE: opposing signal above %.2f", asset, group, cg_thresh)
                 scan_log["signals"].append({"asset": asset, "status": "combined_gate_blocked"})
+                near_misses.append({
+                    "asset": asset, "group": group, "dir": dir_str,
+                    "r": abs_r, "pvt_r": pvt_r_val, "tf": best.timeframe, "period": best.period,
+                    "rejected_at": "GATE", "detail": f"opposing >{cg_thresh:.2f}",
+                })
                 continue
 
             # If it reaches here, it passed physics
@@ -845,7 +885,7 @@ class LiveExtendedBot:
                 best_tf=signal.best_tf, best_period=signal.best_period, pnl_pct=0.0
             )
             xgb_threshold = gt.min_xgb_score if gt else 0.55
-            if xgb_prob <= xgb_threshold:
+            if xgb_prob < xgb_threshold:
                 scan_log["signals"].append({
                     "asset": asset, "group": group, "status": "xgb_rejected",
                     "direction": signal.direction,
@@ -854,6 +894,13 @@ class LiveExtendedBot:
                     "threshold": xgb_threshold,
                 })
                 logger.info("[%s][Grp%s] XGB REJECTED: prob=%.4f <= %.2f", asset, group, xgb_prob, xgb_threshold)
+                near_misses.append({
+                    "asset": asset, "group": group, "dir": dir_str,
+                    "r": round(signal.confidence, 4), "pvt_r": round(signal.pvt_r, 4),
+                    "tf": signal.best_tf, "period": signal.best_period,
+                    "rejected_at": "XGB", "detail": f"prob={xgb_prob:.4f} <= {xgb_threshold:.2f}",
+                    "xgb_prob": round(xgb_prob, 4),
+                })
                 continue
 
             # Entry
@@ -911,6 +958,13 @@ class LiveExtendedBot:
                 "tf": signal.best_tf, "period": signal.best_period, "xgb_prob": round(xgb_prob, 4),
             })
             dir_str = "LONG" if signal.direction == 1 else "SHORT"
+            entries.append({
+                "asset": asset, "group": group, "dir": dir_str,
+                "r": round(signal.confidence, 4), "pvt_r": round(signal.pvt_r, 4),
+                "tf": signal.best_tf, "period": signal.best_period,
+                "xgb_prob": round(xgb_prob, 4), "price": round(price, 4),
+                "lev": lev, "size": round(pos_usd, 0), "sl": round(hard_sl, 4),
+            })
             tg_send(
                 f"<b>NEW {dir_str} — {asset}</b> [Grp {group}]\n"
                 f"XGB: {xgb_prob:.4f} | R: {signal.confidence:.4f}\n"
@@ -921,6 +975,7 @@ class LiveExtendedBot:
             SCAN_LOG_FILE.write_text(json.dumps(scan_log, indent=2))
         except Exception:
             pass
+        return near_misses, entries
 
     def run_cycle(self):
         now = datetime.now(timezone.utc)
@@ -937,7 +992,7 @@ class LiveExtendedBot:
             before = set(self.state.positions.keys())
             self._process_sub_bars()
             closed = before - set(self.state.positions.keys())
-            self._scan_and_enter(all_data, skip_assets=closed)
+            near_misses, entries = self._scan_and_enter(all_data, skip_assets=closed)
             save_state(self.state)
             # Snapshot values for logging (while still holding lock)
             equity = self.state.initial_capital + self.state.realized_pnl
@@ -948,15 +1003,273 @@ class LiveExtendedBot:
             for pos in self.state.positions.values():
                 grp_counts[pos.group] = grp_counts.get(pos.group, 0) + 1
             grp_str = " | ".join(f"{g}:{c}" for g, c in sorted(grp_counts.items())) or "none"
+            # Snapshot open positions for report
+            pos_list = [(a, p.group, p.direction, p.entry_price, p.confidence, p.pvt_r,
+                         p.best_tf, p.best_period, p.xgb_prob, p.leverage, p.position_usd, p.hard_sl)
+                        for a, p in self.state.positions.items()]
 
         logger.info("Cycle complete — Equity: $%.2f | Open: %d/%d [%s] | PnL: $%.2f",
                      equity, n_open, MAX_CONCURRENT, grp_str, rpnl)
-        tg_send(
-            f"<b>Scan #{scan_num}</b> — {now.strftime('%H:%M UTC')}\n"
-            f"Equity: ${equity:,.2f} | Open: {n_open}/{MAX_CONCURRENT}\n"
-            f"Groups: {grp_str}\n"
-            f"Realized PnL: ${rpnl:+,.2f}"
-        )
+
+        # Run offline backtest for the same 1-hour window
+        offline_entries = []
+        try:
+            hour_floor = now.replace(minute=0, second=0, microsecond=0)
+            bt_start = pd.Timestamp(hour_floor - timedelta(hours=1))
+            bt_end = pd.Timestamp(hour_floor)
+            overrides = _load_group_thresholds()
+            bt_params = BacktestParams(
+                initial_capital=self.state.initial_capital,
+                max_concurrent=MAX_CONCURRENT,
+                use_xgb=True,
+                group_overrides=overrides,
+            )
+            bt_engine = BacktestEngine(all_data, bt_params)
+            bt_trades = bt_engine.run(bt_start, bt_end)
+            for t in bt_trades:
+                dir_str = "LONG" if t.direction == 1 else "SHORT"
+                offline_entries.append({
+                    "asset": t.asset, "group": t.group, "dir": dir_str,
+                    "r": round(t.confidence, 4), "pvt_r": round(t.pvt_r, 4),
+                    "tf": t.best_tf, "period": t.best_period,
+                    "price": round(t.entry_price, 4), "lev": t.leverage,
+                    "size": round(t.position_usd, 0), "sl": round(t.hard_sl, 4),
+                })
+            logger.info("Offline backtest: %d entries for %s → %s", len(offline_entries), bt_start, bt_end)
+        except Exception as e:
+            logger.error("Offline backtest failed: %s", e)
+
+        # Build detailed scan report
+        lines = [
+            f"<b>━━━ Scan #{scan_num} ━━━</b> {now.strftime('%H:%M UTC')}",
+            f"Equity: <b>${equity:,.2f}</b> | PnL: ${rpnl:+,.2f}",
+            f"Open: {n_open}/{MAX_CONCURRENT} [{grp_str}]",
+        ]
+
+        # === OFFLINE (Backtest) Results ===
+        lines.append(f"\n<b>🔬 OFFLINE BACKTEST</b>")
+        if offline_entries:
+            lines.append(f"<b>Entries: {len(offline_entries)}</b>")
+            for e in offline_entries:
+                lines.append(
+                    f"  <b>{e['asset']}</b> [{e['group']}] {e['dir']}\n"
+                    f"    R: {e['r']:.4f} | PVT: {e['pvt_r']:.4f}\n"
+                    f"    TF: {e['tf']} P={e['period']} | Lev: {e['lev']}x\n"
+                    f"    Price: ${e['price']} | Size: ${e['size']:,.0f} | SL: ${e['sl']}"
+                )
+        else:
+            lines.append("Entries: None")
+
+        # === LIVE Results ===
+        lines.append(f"\n<b>🟢 LIVE RESULTS</b>")
+        if entries:
+            lines.append(f"<b>Entries: {len(entries)}</b>")
+            for e in entries:
+                lines.append(
+                    f"  <b>{e['asset']}</b> [{e['group']}] {e['dir']}\n"
+                    f"    R: {e['r']:.4f} | PVT: {e['pvt_r']:.4f} | XGB: {e['xgb_prob']:.4f}\n"
+                    f"    TF: {e['tf']} P={e['period']} | Lev: {e['lev']}x\n"
+                    f"    Price: ${e['price']} | Size: ${e['size']:,.0f} | SL: ${e['sl']}"
+                )
+        else:
+            lines.append("Entries: None")
+
+        # Match check
+        live_assets = {e["asset"] for e in entries}
+        offline_assets = {e["asset"] for e in offline_entries}
+        if live_assets == offline_assets:
+            lines.append("\n<b>✅ MATCH: Live = Offline</b>")
+        else:
+            only_offline = offline_assets - live_assets
+            only_live = live_assets - offline_assets
+            if only_offline:
+                lines.append(f"\n<b>⚠️ OFFLINE ONLY:</b> {', '.join(only_offline)}")
+            if only_live:
+                lines.append(f"<b>⚠️ LIVE ONLY:</b> {', '.join(only_live)}")
+
+        # Near misses (passed R-gate but rejected later)
+        if near_misses:
+            lines.append(f"\n<b>⚠️ NEAR MISSES ({len(near_misses)})</b>")
+            for nm in near_misses:
+                xgb_str = f" | XGB: {nm['xgb_prob']:.4f}" if 'xgb_prob' in nm else ""
+                lines.append(
+                    f"  <b>{nm['asset']}</b> [{nm['group']}] {nm['dir']}\n"
+                    f"    R: {nm['r']:.4f} | PVT: {nm['pvt_r']:.4f}{xgb_str}\n"
+                    f"    TF: {nm['tf']} P={nm['period']}\n"
+                    f"    ❌ {nm['rejected_at']}: {nm['detail']}"
+                )
+
+        # Current open positions
+        if pos_list:
+            lines.append(f"\n<b>📊 OPEN POSITIONS ({len(pos_list)})</b>")
+            for a, grp, d, ep, conf, pvt_r, tf, per, xp, lv, sz, sl in pos_list:
+                ds = "L" if d == 1 else "S"
+                lines.append(
+                    f"  {a}[{grp}] {ds} @{ep:.4f} | R:{conf:.3f} PVT:{pvt_r:.3f} XGB:{xp:.3f} | {tf} P{per} | {lv}x ${sz:,.0f}"
+                )
+
+        tg_send("\n".join(lines))
+
+    def scan_5m_asset(self, asset: str):
+        """Run full physics+XGBoost pipeline for one asset on 5m data.
+        Called by websocket thread on each closed 5m candle."""
+        global _cached_data
+        if _cached_data is None:
+            return
+        with self.lock:
+            if self.state.circuit_breaker:
+                return
+            if asset in self.state.positions:
+                return
+            if len(self.state.positions) >= MAX_CONCURRENT:
+                return
+
+            group = get_group(asset)
+            gt = self.group_thresholds.get(group, DEFAULT_THRESHOLDS.get(group))
+            self._apply_group_params(asset)
+
+            asset_data = _cached_data.get(asset)
+            if not asset_data:
+                return
+
+            now = datetime.now(timezone.utc)
+            scan_ns = int(now.timestamp() * 1_000_000_000)
+            
+            # Update state timestamp so dashboard knows a 5m scan happened
+            self.state.last_scan_ts = now.isoformat()
+            save_state(self.state)
+
+            # Update SCAN_LOG_FILE so dashboard shows this 5m activity
+            try:
+                ws_scan_log = {
+                    "timestamp": f"{now.strftime('%H:%M:%S')} (WS-5m)",
+                    "scan_number": self.state.total_scans,
+                    "signals": [{"asset": asset, "status": "scanning", "tf": "5m"}]
+                }
+                SCAN_LOG_FILE.write_text(json.dumps(ws_scan_log, indent=2))
+            except Exception:
+                pass
+
+            scan_dfs = build_scan_dataframes(asset_data, scan_ns - 1, scan_tfs=["5m"])
+            df_4h = build_htf_dataframe(asset_data, scan_ns - 14400 * 10**9)
+            if not scan_dfs or df_4h is None:
+                return
+
+            best, all_results = find_best_regression(scan_dfs)
+            if not best:
+                return
+
+            abs_r = abs(best.pearson_r)
+            direction = 1 if best.slope < 0 else -1
+            min_r = gt.min_confidence if gt else self.consensus["min_pearson_r"]
+            if abs_r < min_r:
+                return
+
+            best_df_7d = trim_to_7d(scan_dfs[best.timeframe], best.timeframe)
+            pvt = compute_pvt_regression(best_df_7d, best.period)
+            min_pvt_r = gt.min_pvt_r if gt else self.consensus["min_pvt_r"]
+            pvt_passes, _ = check_pvt_alignment(direction, abs_r, pvt, min_pvt_r)
+            if not pvt_passes:
+                return
+
+            htf_bias = get_htf_bias(df_4h)
+            if htf_bias == 0 or htf_bias != direction:
+                return
+
+            cg_thresh = gt.combined_gate if gt else self.consensus["combined_gate"]
+            if not check_combined_gate(direction, all_results, cg_thresh):
+                return
+
+            signal = scan_asset(asset, scan_dfs, df_4h,
+                                min_pearson_r=min_r, min_pvt_r=min_pvt_r,
+                                combined_gate_threshold=cg_thresh, group=group)
+            if not signal:
+                return
+
+            xgb_prob = predict_probability(
+                self.xgb_model, confidence=signal.confidence, pvt_r=signal.pvt_r,
+                best_tf=signal.best_tf, best_period=signal.best_period, pnl_pct=0.0
+            )
+            xgb_threshold = gt.min_xgb_score if gt else 0.55
+            if xgb_prob < xgb_threshold:
+                logger.info("[WS-5m][%s][Grp%s] XGB REJECTED: prob=%.4f <= %.2f",
+                            asset, group, xgb_prob, xgb_threshold)
+                return
+
+            price = signal.entry_price if not self.live_mode else (fetch_ticker_price(f"{asset}USDT") or signal.entry_price)
+            lev = get_leverage(signal.confidence)
+            vol_scalar = 0.75 if asset in HIGH_VOL_ASSETS else 1.0
+            pos_frac = gt.pos_frac if gt else self.consensus["pos_frac"]
+            pos_usd = self.state.initial_capital * pos_frac * lev * vol_scalar
+            if pos_usd <= 0 or lev == 0:
+                return
+
+            hard_sl_mult = gt.hard_sl_mult if gt else self.consensus["hard_sl_mult"]
+            hard_sl = compute_hard_sl(price, signal.atr, signal.direction, hard_sl_mult)
+            trail_buffer = gt.trail_buffer if gt else self.consensus["trail_buffer"]
+            std_price = signal.midline * signal.std_dev
+            if signal.direction == 1:
+                trail_sl = min(price, signal.midline - trail_buffer * std_price)
+            else:
+                trail_sl = max(price, signal.midline + trail_buffer * std_price)
+
+            quantity, order_id, sl_order_id = 0.0, "", ""
+            if self.live_mode:
+                side = "buy" if signal.direction == 1 else "sell"
+                order = place_market_order(f"{asset}USDT", side, pos_usd, lev)
+                if not order:
+                    return
+                order_id = str(order.get("id", ""))
+                quantity = float(order.get("filled", 0) or order.get("amount", 0))
+                price = float(order.get("average", price) or price)
+                if quantity <= 0:
+                    logger.error("ORDER FILLED qty=0 for %s — skipping", asset)
+                    return
+                sl_order = place_stop_loss(f"{asset}USDT",
+                    "sell" if signal.direction == 1 else "buy", quantity, hard_sl)
+                if sl_order:
+                    sl_order_id = str(sl_order.get("id", ""))
+
+            self.state.trade_counter += 1
+            pos = LivePosition(
+                trade_id=self.state.trade_counter, asset=asset, group=group,
+                symbol=f"{asset}USDT",
+                direction=signal.direction, entry_price=price, entry_ts=now.isoformat(),
+                hard_sl=hard_sl, trail_sl=trail_sl, midline=signal.midline, std_dev=signal.std_dev,
+                best_tf=signal.best_tf, best_period=signal.best_period, confidence=signal.confidence,
+                pvt_r=signal.pvt_r, leverage=lev, position_usd=pos_usd, quantity=quantity,
+                peak_r=signal.confidence, order_id=order_id, sl_order_id=sl_order_id,
+                last_bar_ns=scan_ns, xgb_prob=xgb_prob,
+            )
+            self.state.positions[asset] = pos
+            save_state(self.state)
+
+            # Update SCAN_LOG_FILE for dashboard (5m WebSocket update)
+            try:
+                # We create a single-asset scan log entry so the dashboard knows what just happened
+                ws_scan_log = {
+                    "timestamp": f"{now.isoformat()} (WS-5m)",
+                    "scan_number": self.state.total_scans,
+                    "signals": [{
+                        "asset": asset, "group": group, "status": "entered",
+                        "direction": signal.direction,
+                        "confidence": round(signal.confidence, 4), "pvt_r": round(signal.pvt_r, 4),
+                        "tf": signal.best_tf, "period": signal.best_period, "xgb_prob": round(xgb_prob, 4),
+                    }]
+                }
+                SCAN_LOG_FILE.write_text(json.dumps(ws_scan_log, indent=2))
+            except Exception as e:
+                logger.error("Failed to write WS scan log: %s", e)
+
+            dir_str = "LONG" if signal.direction == 1 else "SHORT"
+            logger.info("[WS-5m] NEW %s — %s [Grp%s] | R:%.4f | XGB:%.4f | $%.0f",
+                        dir_str, asset, group, signal.confidence, xgb_prob, pos_usd)
+            tg_send(
+                f"<b>NEW {dir_str} — {asset}</b> [Grp {group}] (5m WS)\n"
+                f"XGB: {xgb_prob:.4f} | R: {signal.confidence:.4f}\n"
+                f"Size: ${pos_usd:,.0f} | Lev: {lev}x | SL: ${hard_sl:.4f}\n"
+                f"TF: {signal.best_tf} | Period: {signal.best_period}"
+            )
 
     def send_status(self):
         with self.lock:
@@ -999,7 +1312,8 @@ def start_websocket_stream(bot: "LiveExtendedBot"):
 
     def on_message(ws, message):
         try:
-            data = json.loads(message)
+            msg = json.loads(message)
+            data = msg.get("data", msg)  # combined stream wraps in {"stream":..,"data":..}
             k = data.get("k", {})
             # Only process if bar is CLOSED
             if k.get("x"):
@@ -1014,6 +1328,8 @@ def start_websocket_stream(bot: "LiveExtendedBot"):
                     ts_ms=int(k["t"])
                 )
                 logger.debug("WS BAR RECEIVED: %s %s @ %.4f", asset, k["i"], float(k["c"]))
+                # Run physics+XGBoost scan on this asset (matches backtest behavior)
+                bot.scan_5m_asset(asset)
         except Exception as e:
             logger.error("Websocket message error: %s", e)
 
@@ -1028,7 +1344,7 @@ def start_websocket_stream(bot: "LiveExtendedBot"):
     def _run_ws():
         # Build stream names for 5m timeframes only (used for sub-bar exits)
         streams = [f"{s.lower()}@kline_5m" for s in ALL_SYMBOLS]
-        stream_url = f"wss://fstream.binance.com/ws/{'/'.join(streams)}"
+        stream_url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
         ws = WebSocketApp(stream_url, on_message=on_message, on_error=on_error, on_close=on_close)
         ws.run_forever()
 

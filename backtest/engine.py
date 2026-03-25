@@ -79,6 +79,8 @@ class BacktestParams:
     # XGB threshold (per-group override via GroupThresholds)
     xgb_threshold: float = 0.55
     use_xgb: bool = True          # New toggle
+    # Entry price: True = use signal close (matches live), False = next bar open (classic)
+    use_signal_price: bool = False
     # Group-specific overrides (None = use global defaults)
     group_overrides: dict | None = None
 
@@ -318,14 +320,19 @@ class BacktestEngine:
                 except Exception as e:
                     logger.error("XGB prediction failed in backtest: %s", e)
 
-            # Entry at next bar open on signal's TF
+            # Entry price
             ad = asset_data.get(signal.best_tf)
             if ad is None:
                 continue
-            entry_idx = np.searchsorted(ad.timestamps, current_1h_ns, side="right")
-            if entry_idx >= len(ad.timestamps):
-                continue
-            entry_price = float(ad.open_[entry_idx])
+            if self.params.use_signal_price:
+                # Match live bot: use signal's close price at scan time
+                entry_price = signal.entry_price
+            else:
+                # Classic backtest: next bar's open price
+                entry_idx = np.searchsorted(ad.timestamps, current_1h_ns, side="right")
+                if entry_idx >= len(ad.timestamps):
+                    continue
+                entry_price = float(ad.open_[entry_idx])
 
             # Position sizing
             lev = get_leverage(signal.confidence)

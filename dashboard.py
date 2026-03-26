@@ -39,6 +39,7 @@ STATE_FILE = BASE_DIR / "live_extended_state.json"
 TRADES_FILE = BASE_DIR / "live_extended_trades.csv"
 SCAN_LOG_FILE = BASE_DIR / "logs" / "scan_results.json"
 DASHBOARD_SCAN_CACHE = BASE_DIR / "logs" / "dashboard_scan_cache.json"
+DASHBOARD_5M_SCAN_CACHE = BASE_DIR / "logs" / "dashboard_5m_scan_cache.json"
 WFV_FILE = BASE_DIR / "wfv_results.json"
 OPTIMIZED_THRESHOLDS_FILE = BASE_DIR / "config" / "optimized_thresholds.json"
 LOG_FILE = BASE_DIR / "logs" / "live_extended_bot.log"
@@ -410,6 +411,187 @@ def run_dashboard_scan() -> list[dict]:
                  "first_fail": ""}]
 
 
+@st.cache_data(ttl=30)
+def run_dashboard_5m_scan() -> list[dict]:
+    """Run a READ-ONLY 5m-only scan of all 33 assets — mirrors bot's WS scan_5m_asset().
+    Only checks the 5m timeframe for regressions (like bot does between hourly scans)."""
+    try:
+        from neo_flow.adaptive_engine import (
+            find_best_regression, compute_pvt_regression, check_pvt_alignment,
+            get_htf_bias, check_combined_gate, trim_to_7d,
+        )
+        from ml.train_meta_model import predict_probability, load_model
+
+        xgb_model = None
+        xgb_path = BASE_DIR / "models" / "meta_xgb.json"
+        if xgb_path.exists():
+            xgb_model, _ = load_model(xgb_path)
+
+        results = []
+        for asset in ASSETS:
+            symbol = f"{asset}USDT"
+            group = get_group(asset)
+            gt = GROUP_THRESHOLDS.get(group, DEFAULT_THRESHOLDS[group])
+
+            # Only fetch 5m candles (matches bot WS-5m behavior)
+            scan_dfs = {}
+            df_5m = _fetch_live_candles(symbol, "5m", BARS_7D["5m"])
+            if not df_5m.empty:
+                scan_dfs["5m"] = df_5m
+
+            row = {
+                "asset": asset, "group": group, "best_r": 0, "pvt_r": 0,
+                "direction": 0, "best_tf": "-", "best_period": 0,
+                "midline": 0, "std_dev": 0, "xgb_prob": 0,
+                "gate_r": False, "gate_pvt": False, "gate_htf": False,
+                "gate_combined": False, "gate_xgb": False,
+                "reject_reason": "", "final_status": "no_signal",
+                "entry_price": 0,
+                "r_diff": 0.0, "pvt_diff": 0.0, "xgb_diff": 0.0,
+                "htf_bias_str": "-", "pvt_detail": "", "combined_detail": "",
+                "first_fail": "", "scan_type": "5m",
+            }
+
+            if not scan_dfs:
+                row["reject_reason"] = "No 5m data"
+                row["first_fail"] = "No Data"
+                results.append(row)
+                continue
+
+            best, all_regs = find_best_regression(scan_dfs)
+            if best is None:
+                row["reject_reason"] = "No valid 5m regression"
+                row["first_fail"] = "R-Gate"
+                results.append(row)
+                continue
+
+            abs_r = abs(best.pearson_r)
+            direction = 1 if best.slope < 0 else -1
+            row["best_r"] = round(abs_r, 4)
+            row["direction"] = direction
+            row["best_tf"] = best.timeframe
+            row["best_period"] = best.period
+            row["midline"] = round(best.midline, 6)
+            row["std_dev"] = round(best.std_dev, 6)
+            row["r_diff"] = round(abs_r - gt.min_confidence, 4)
+
+            best_df = scan_dfs.get(best.timeframe)
+            if best_df is not None and not best_df.empty:
+                row["entry_price"] = float(best_df.iloc[-1]["close"])
+
+            # Gate 1: Pearson R
+            if abs_r >= gt.min_confidence:
+                row["gate_r"] = True
+            else:
+                row["first_fail"] = row["first_fail"] or "R-Gate"
+                row["reject_reason"] = f"|R| {abs_r:.4f} < {gt.min_confidence}"
+
+            # Gate 2: PVT alignment
+            pvt_result = None
+            if best_df is not None and not best_df.empty:
+                best_df_7d = trim_to_7d(best_df, best.timeframe)
+                pvt_result = compute_pvt_regression(best_df_7d, best.period)
+                pvt_abs_r = abs(pvt_result.pearson_r)
+                row["pvt_r"] = round(pvt_abs_r, 4)
+                row["pvt_diff"] = round(pvt_abs_r - gt.min_pvt_r, 4)
+                pvt_dir_str = "RISING" if pvt_result.direction == 1 else ("FALLING" if pvt_result.direction == -1 else "FLAT")
+                row["pvt_detail"] = pvt_dir_str
+
+                if row["gate_r"]:
+                    pvt_passes, pvt_reason = check_pvt_alignment(direction, abs_r, pvt_result)
+                    if pvt_passes:
+                        row["gate_pvt"] = True
+                    else:
+                        row["first_fail"] = row["first_fail"] or "PVT-Gate"
+                        row["reject_reason"] = row["reject_reason"] or pvt_reason
+
+            # Gate 3: 4H HTF bias (still uses 4h data like bot does)
+            htf_bias = 0
+            df_4h = _fetch_live_candles(symbol, "4h", BARS_7D["4h"])
+            htf_detail = ""
+            if not df_4h.empty:
+                htf_bias = get_htf_bias(df_4h)
+                try:
+                    from neo_flow.adaptive_engine import detect_mss, compute_ema, MSS_LOOKBACK as _MSS_LB
+                    if len(df_4h) >= _MSS_LB + 1:
+                        _w = df_4h.iloc[-(_MSS_LB + 1):-1]
+                        _cur = df_4h.iloc[-1]
+                        _sh = float(_w["high"].max())
+                        _sl = float(_w["low"].min())
+                        _cp = float(_cur["close"])
+                        _to_bull = ((_sh - _cp) / _cp) * 100
+                        _to_bear = ((_cp - _sl) / _cp) * 100
+                        _ema_f = float(compute_ema(df_4h["close"], 21).iloc[-1])
+                        _ema_s = float(compute_ema(df_4h["close"], 55).iloc[-1])
+                        _ema_str = "EMA:Bull" if _ema_f > _ema_s else "EMA:Bear"
+                        htf_detail = f"{_ema_str} | +{_to_bull:.1f}%toHH -{_to_bear:.1f}%toLL"
+                except Exception:
+                    pass
+
+            row["htf_bias_str"] = {1: "BULL", -1: "BEAR", 0: "NEUTRAL"}.get(htf_bias, "?")
+            row["htf_detail"] = htf_detail
+            if row["gate_r"] and row["gate_pvt"]:
+                if htf_bias != 0 and htf_bias == direction:
+                    row["gate_htf"] = True
+                else:
+                    row["first_fail"] = row["first_fail"] or "4H-Trend"
+                    if htf_bias == 0:
+                        row["reject_reason"] = row["reject_reason"] or f"4H neutral ({htf_detail})"
+                    else:
+                        dir_s = "LONG" if direction == 1 else "SHORT"
+                        row["reject_reason"] = row["reject_reason"] or f"4H {row['htf_bias_str']} vs signal {dir_s}"
+
+            # Gate 4: Combined gate
+            combined_pass = check_combined_gate(direction, all_regs) if all_regs else True
+            max_opposing_r = 0.0
+            for r in all_regs:
+                r_dir = -1 if r.slope > 0 else (1 if r.slope < 0 else 0)
+                if r_dir != 0 and r_dir != direction:
+                    max_opposing_r = max(max_opposing_r, abs(r.pearson_r))
+            row["combined_detail"] = f"max_opp |R|={max_opposing_r:.4f}" if max_opposing_r > 0 else "no opposing"
+
+            if row["gate_r"] and row["gate_pvt"] and row["gate_htf"]:
+                if combined_pass:
+                    row["gate_combined"] = True
+                else:
+                    row["first_fail"] = row["first_fail"] or "Combined"
+                    row["reject_reason"] = row["reject_reason"] or f"Opposing |R| {max_opposing_r:.4f} > {gt.combined_gate}"
+
+            # Gate 5: XGBoost
+            if xgb_model is not None and pvt_result is not None:
+                xgb_prob = predict_probability(
+                    xgb_model, confidence=abs_r, pvt_r=abs(pvt_result.pearson_r),
+                    best_tf=best.timeframe, best_period=best.period, pnl_pct=0.0,
+                )
+                row["xgb_prob"] = round(xgb_prob, 4)
+                row["xgb_diff"] = round(xgb_prob - gt.min_xgb_score, 4)
+
+                if row["gate_r"] and row["gate_pvt"] and row["gate_htf"] and row["gate_combined"]:
+                    if xgb_prob > gt.min_xgb_score:
+                        row["gate_xgb"] = True
+                        row["final_status"] = "qualified"
+                    else:
+                        row["first_fail"] = row["first_fail"] or "XGBoost"
+                        row["final_status"] = "xgb_rejected"
+                        row["reject_reason"] = row["reject_reason"] or f"XGB {xgb_prob:.4f} <= {gt.min_xgb_score}"
+
+            if not row["first_fail"] and row["final_status"] != "qualified":
+                row["final_status"] = "blocked"
+
+            results.append(row)
+
+        return results
+    except Exception as e:
+        return [{"asset": "ERROR", "group": "-", "reject_reason": str(e),
+                 "final_status": "error", "best_r": 0, "pvt_r": 0, "direction": 0,
+                 "best_tf": "-", "best_period": 0, "midline": 0, "std_dev": 0,
+                 "xgb_prob": 0, "gate_r": False, "gate_pvt": False, "gate_htf": False,
+                 "gate_combined": False, "gate_xgb": False, "entry_price": 0,
+                 "r_diff": 0, "pvt_diff": 0, "xgb_diff": 0,
+                 "htf_bias_str": "-", "pvt_detail": "", "combined_detail": "",
+                 "first_fail": "", "scan_type": "5m"}]
+
+
 def _detect_live_mode() -> bool:
     """Check if the running bot has --live flag."""
     try:
@@ -618,10 +800,15 @@ def render_cockpit(state: dict, prices: dict):
     mode_str = "LIVE" if is_live else "DRY-RUN"
     bot_status = "CB TRIPPED" if cb else ("RUNNING" if pid else "STOPPED")
 
+    # Count 5m vs HTF trades
+    n_5m_trades = sum(1 for p in positions.values() if p.get("best_tf") == "5m")
+    n_htf_trades = len(positions) - n_5m_trades
+    scan_source_str = f"5m:{n_5m_trades} HTF:{n_htf_trades}" if positions else "none"
+
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Bot Equity", f"${equity:,.2f}", f"{realized:+,.2f}")
     c2.metric("Drawdown", f"{dd:.2f}%")
-    c3.metric("Open / Max", f"{len(positions)} / 8")
+    c3.metric("Open / Max", f"{len(positions)} / 8", delta=scan_source_str, delta_color="off")
     c4.metric("Groups", grp_str)
     c5.metric("Scans", f"{state.get('total_scans', 0)}")
     if is_live:
@@ -705,7 +892,10 @@ def render_cockpit(state: dict, prices: dict):
         with st.container(border=True):
             tc1, tc2, tc3, tc4 = st.columns([1.5, 2, 2, 1.5])
             with tc1:
-                st.markdown(f"**{dir_emoji} {asset}** `{dir_str}`")
+                scan_origin = "WS-5m" if pos.get("best_tf") == "5m" else "Hourly"
+                origin_color = "#f6c343" if scan_origin == "WS-5m" else "#39afd1"
+                origin_badge = f'<span style="background:rgba({",".join(str(int(origin_color.lstrip("#")[i:i+2], 16)) for i in (0,2,4))},0.2);color:{origin_color};padding:1px 6px;border-radius:6px;font-size:0.7rem;">{scan_origin}</span>'
+                st.markdown(f"**{dir_emoji} {asset}** `{dir_str}` {origin_badge}", unsafe_allow_html=True)
                 st.markdown(f'{group_badge(group)}', unsafe_allow_html=True)
                 st.caption(f"TF: {pos['best_tf']} | P: {pos['best_period']} | Lev: {leverage}x")
             with tc2:
@@ -743,14 +933,24 @@ def render_intelligence(state: dict, scan_log: dict):
     rem_1h = (next_1h - now).total_seconds()
     m1h, s1h = int(rem_1h // 60), int(rem_1h % 60)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Next 5m Scan", f"{m5:02d}:{s5:02d}", delta="WS stream active")
     c2.metric("Last Activity", time_since(state.get("last_scan_ts", "")))
     c3.metric("Next Audit (1h)", f"{m1h:02d}:{s1h:02d}")
+    # Count 5m-originated positions
+    positions = state.get("positions", {})
+    n_5m = sum(1 for p in positions.values() if p.get("best_tf") == "5m")
+    n_other = len(positions) - n_5m
+    c4.metric("5m / HTF Trades", f"{n_5m} / {n_other}", delta=f"{len(positions)} open")
     st.markdown("---")
 
-    # Group filter
-    group_filter = st.radio("Filter by Group", ["All", "A (Majors)", "B (Tech/AI)", "C (Meme)"], horizontal=True)
+    # Scan mode + Group filter
+    filter_col1, filter_col2 = st.columns([1, 2])
+    with filter_col1:
+        scan_mode = st.radio("Scan Mode", ["Full (All TFs)", "5m Quick Scan"], horizontal=True,
+                             help="Full: scans 5m+30m+1h+4h (like hourly cycle). 5m Quick: scans only 5m TF (like WS inter-hour scan).")
+    with filter_col2:
+        group_filter = st.radio("Filter by Group", ["All", "A (Majors)", "B (Tech/AI)", "C (Meme)"], horizontal=True)
 
     # Show group-specific thresholds
     with st.expander("Group Thresholds", expanded=False):
@@ -761,14 +961,20 @@ def render_intelligence(state: dict, scan_log: dict):
                 st.caption(f"|R| >= {gt.min_confidence} | PVT >= {gt.min_pvt_r} | XGB > {gt.min_xgb_score}")
                 st.caption(f"Combined <= {gt.combined_gate} | SL: {gt.hard_sl_mult}x | Trail: {gt.trail_buffer}")
 
-    st.subheader(f"Live Vetting — {len(ASSETS)} Coins vs Group Thresholds")
+    is_5m_mode = scan_mode == "5m Quick Scan"
+    mode_label = "5m Quick Scan" if is_5m_mode else "Full (All TFs)"
+    cache_file = DASHBOARD_5M_SCAN_CACHE if is_5m_mode else DASHBOARD_SCAN_CACHE
+
+    st.subheader(f"Live Vetting — {len(ASSETS)} Coins | {mode_label}")
+    if is_5m_mode:
+        st.caption("Scanning **5m timeframe only** — mirrors the bot's inter-hour WebSocket scan (`scan_5m_asset`)")
 
     # Load cached scan or run new one on button click
     scan_results = None
     cached_ts = ""
-    if DASHBOARD_SCAN_CACHE.exists():
+    if cache_file.exists():
         try:
-            cache = json.loads(DASHBOARD_SCAN_CACHE.read_text())
+            cache = json.loads(cache_file.read_text())
             scan_results = cache.get("results", [])
             cached_ts = cache.get("timestamp", "")
         except Exception:
@@ -776,29 +982,32 @@ def render_intelligence(state: dict, scan_log: dict):
 
     btn_col, info_col = st.columns([1, 3])
     with btn_col:
-        do_scan = st.button("Scan Now", type="primary", use_container_width=True)
+        btn_label = "5m Scan Now" if is_5m_mode else "Full Scan Now"
+        do_scan = st.button(btn_label, type="primary", use_container_width=True)
     with info_col:
         if cached_ts:
-            st.caption(f"Last dashboard scan: {cached_ts}")
+            st.caption(f"Last {mode_label} scan: {cached_ts}")
         else:
-            st.caption("No cached scan — click **Scan Now** to run")
+            st.caption(f"No cached {mode_label} scan — click **{btn_label}** to run")
 
     if do_scan:
-        with st.spinner(f"Scanning {len(ASSETS)} assets through 5 gates..."):
-            scan_results = run_dashboard_scan()
+        spinner_msg = f"5m scanning {len(ASSETS)} assets through 5 gates..." if is_5m_mode else f"Full scanning {len(ASSETS)} assets through 5 gates..."
+        with st.spinner(spinner_msg):
+            scan_results = run_dashboard_5m_scan() if is_5m_mode else run_dashboard_scan()
         if scan_results and not (len(scan_results) == 1 and scan_results[0].get("asset") == "ERROR"):
-            DASHBOARD_SCAN_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_data = {
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "scan_mode": "5m" if is_5m_mode else "full",
                 "results": scan_results,
             }
-            DASHBOARD_SCAN_CACHE.write_text(json.dumps(cache_data, indent=2))
+            cache_file.write_text(json.dumps(cache_data, indent=2))
 
     if not scan_results or (len(scan_results) == 1 and scan_results[0].get("asset") == "ERROR"):
         if scan_results:
             st.error(f"Scan error: {scan_results[0].get('reject_reason', 'Unknown')}")
         else:
-            st.info("Click **Scan Now** to run a live scan of all 33 assets.")
+            st.info(f"Click **{btn_label}** to run a {'5m-only' if is_5m_mode else 'full'} live scan of all 33 assets.")
         _render_bot_scan_log(scan_log)
         return
 
@@ -993,63 +1202,144 @@ def render_intelligence(state: dict, scan_log: dict):
                     st.markdown(gates_html, unsafe_allow_html=True)
 
     st.markdown("---")
-    _render_bot_scan_log(scan_log)
-
+    # _render_bot_scan_log(scan_log) - Removed duplicate
+    return
 
 def _render_bot_scan_log(scan_log: dict):
-    with st.expander("Bot's Last Scan Log", expanded=False):
-        signals = scan_log.get("signals", [])
-        ts = scan_log.get("timestamp", "")
-        scan_num = scan_log.get("scan_number", 0)
-        if ts:
-            st.caption(f"Bot scan #{scan_num} at: {ts}")
-        if signals:
-            STATUS_COLORS = {
-                "entered": "#00d97e", "xgb_rejected": "#f6c343",
-                "physics_rejected": "#e63757", "in_position": "#39afd1",
-                "just_closed": "#888", "no_data": "#555", "max_positions": "#888",
-                "scanning": "#39afd1",
-            }
-            rows_html = ""
-            for s in signals:
-                status = s.get("status", "?")
-                color = STATUS_COLORS.get(status, "#888")
-                asset = s.get("asset", "?")
-                group = s.get("group", ASSET_TO_GROUP.get(asset, "?"))
-                detail_parts = []
-                if s.get("direction"):
-                    detail_parts.append("LONG" if s["direction"] == 1 else "SHORT")
-                if s.get("confidence"):
-                    detail_parts.append(f"|R|={s['confidence']:.4f}")
-                if s.get("xgb_prob"):
-                    detail_parts.append(f"XGB={s['xgb_prob']:.4f}")
-                if s.get("tf"):
-                    detail_parts.append(f"{s['tf']}/{s.get('period','')}")
-                detail = " | ".join(detail_parts)
-                grp_color = GROUP_COLORS.get(group, "#888")
-                rows_html += (
-                    f'<tr style="border-bottom:1px solid #1e2235;">'
-                    f'<td style="padding:4px 6px;"><b>{asset}</b></td>'
-                    f'<td style="padding:4px 6px;color:{grp_color}">{group}</td>'
-                    f'<td style="padding:4px 6px;color:{color}">{status}</td>'
-                    f'<td style="padding:4px 6px;color:#aaa;font-size:0.85em">{detail}</td>'
-                    f'</tr>'
-                )
-            table = (
-                '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
-                '<thead><tr style="border-bottom:2px solid #333;color:#8b92a5;">'
-                '<th style="text-align:left;padding:4px 6px;">Coin</th>'
-                '<th style="text-align:left;padding:4px 6px;">Grp</th>'
-                '<th style="text-align:left;padding:4px 6px;">Status</th>'
-                '<th style="text-align:left;padding:4px 6px;">Details</th>'
-                '</tr></thead><tbody>' + rows_html + '</tbody></table>'
-            )
-            st.markdown(table, unsafe_allow_html=True)
-        else:
-            st.caption("No scan data recorded yet.")
+    st.subheader("Bot Activity Log")
 
-    with st.expander("Bot Log (last 30 lines)", expanded=False):
-        log_lines = parse_recent_logs(30)
+    # Bot status check
+    bot_state = load_bot_state()
+    pid = get_bot_pid()
+    current_asset = bot_state.get("current_scanning_asset", "")
+    last_scan = bot_state.get("last_scan_ts", "")
+    total_scans = bot_state.get("total_scans", 0)
+
+    # Status bar
+    if pid:
+        st.success(f"Bot is **RUNNING** (PID: {pid}) | Scans: {total_scans} | Last: {time_since(last_scan)}")
+    else:
+        st.warning(f"Bot is **STOPPED** | Last scan: {time_since(last_scan)} | Total scans: {total_scans}")
+
+    # We maintain a persistent view of all 33 assets
+    # Using session_state to keep history between fragment refreshes
+    if "asset_log_state" not in st.session_state:
+        st.session_state.asset_log_state = {a: {"status": "IDLE", "r": 0.0, "pvt": 0.0, "xgb": 0.0, "detail": "", "scan_type": "-"} for a in ALL_ASSETS}
+
+    # Update state with latest scan_log data
+    signals = scan_log.get("signals", [])
+    ts = scan_log.get("timestamp", "")
+    is_ws_scan = "WS-5m" in ts if ts else False
+
+    for s in signals:
+        asset = s.get("asset")
+        if asset in st.session_state.asset_log_state:
+            scan_type = "WS-5m" if (is_ws_scan or s.get("tf") == "5m") else "Hourly"
+            st.session_state.asset_log_state[asset].update({
+                "status": s.get("status", "IDLE").upper(),
+                "r": s.get("confidence", 0.0),
+                "pvt": s.get("pvt_r", 0.0),
+                "xgb": s.get("xgb_prob", 0.0),
+                "detail": s.get("detail", ""),
+                "scan_type": scan_type,
+            })
+
+    # Also populate from trade history for assets that have traded
+    if TRADES_FILE.exists():
+        try:
+            tdf = pd.read_csv(TRADES_FILE)
+            for _, t in tdf.iterrows():
+                a = t.get("asset", "")
+                if a in st.session_state.asset_log_state:
+                    existing = st.session_state.asset_log_state[a]
+                    if existing["status"] == "IDLE":
+                        pnl = t.get("pnl_pct", 0)
+                        result = "WIN" if pnl > 0 else "LOSS"
+                        scan_t = "WS-5m" if t.get("best_tf") == "5m" else "Hourly"
+                        st.session_state.asset_log_state[a].update({
+                            "status": f"LAST: {result} ({pnl:+.1f}%)",
+                            "r": t.get("confidence", 0.0),
+                            "pvt": t.get("pvt_r", 0.0),
+                            "xgb": 0.0,
+                            "detail": f"{t.get('exit_reason', '')} | {t.get('best_tf', '')}",
+                            "scan_type": scan_t,
+                        })
+        except Exception:
+            pass
+
+    # Mark open positions
+    positions = bot_state.get("positions", {})
+    for asset, pos in positions.items():
+        if asset in st.session_state.asset_log_state:
+            scan_t = "WS-5m" if pos.get("best_tf") == "5m" else "Hourly"
+            st.session_state.asset_log_state[asset].update({
+                "status": "OPEN",
+                "r": pos.get("confidence", 0.0),
+                "pvt": pos.get("pvt_r", 0.0),
+                "xgb": pos.get("xgb_prob", 0.0),
+                "detail": f"{'LONG' if pos.get('direction') == 1 else 'SHORT'} | {pos.get('best_tf', '')}",
+                "scan_type": scan_t,
+            })
+
+    if ts:
+        st.caption(f"Last Scan Event: **{ts}**" + (f" | Currently Scanning: **{current_asset}**" if current_asset else ""))
+
+    data = []
+    for asset in ALL_ASSETS:
+        state = st.session_state.asset_log_state[asset]
+        status = state["status"]
+        if asset == current_asset:
+            status = "SCANNING"
+
+        data.append({
+            "Asset": asset,
+            "Group": get_group(asset),
+            "Scan": state.get("scan_type", "-"),
+            "Status": status,
+            "Pearson R": state["r"],
+            "PVT R": state["pvt"],
+            "XGB": state["xgb"],
+            "Detail": state["detail"]
+        })
+
+    df = pd.DataFrame(data)
+
+    def style_bot_log(row):
+        group = row["Group"]
+        gt = GROUP_THRESHOLDS.get(group, DEFAULT_THRESHOLDS.get(group))
+
+        # Scan type color
+        scan_color = "color: #f6c343" if row["Scan"] == "WS-5m" else ("color: #39afd1" if row["Scan"] == "Hourly" else "color: #555")
+
+        # Status colors
+        status_color = "#555"
+        if "ENTERED" in row["Status"] or "OPEN" in row["Status"]: status_color = "#00d97e; font-weight: bold"
+        elif "WIN" in row["Status"]: status_color = "#00d97e"
+        elif "LOSS" in row["Status"]: status_color = "#e63757"
+        elif "REJECTED" in row["Status"] or "CONFLICT" in row["Status"]: status_color = "#e63757"
+        elif "SCANNING" in row["Status"]: status_color = "#39afd1; font-weight: bold"
+
+        # Threshold-based colors
+        r_color = "color: #e63757" if row["Pearson R"] > 0 and row["Pearson R"] < gt.min_confidence else "color: #00d97e"
+        if row["Pearson R"] == 0: r_color = "color: #444"
+
+        pvt_color = "color: #e63757" if row["PVT R"] > 0 and row["PVT R"] < gt.min_pvt_r else "color: #00d97e"
+        if row["PVT R"] == 0: pvt_color = "color: #444"
+
+        xgb_color = "color: #e63757" if row["XGB"] > 0 and row["XGB"] < gt.min_xgb_score else "color: #00d97e"
+        if row["XGB"] == 0: xgb_color = "color: #444"
+
+        return ["", "", scan_color, f"color: {status_color}", r_color, pvt_color, xgb_color, ""]
+
+    st.dataframe(
+        df.style.apply(style_bot_log, axis=1),
+        use_container_width=True,
+        hide_index=True,
+        height=600,
+    )
+
+    with st.expander("Bot Log (last 50 lines)", expanded=False):
+        log_lines = parse_recent_logs(50)
         if log_lines:
             st.code("\n".join(log_lines), language="log")
         else:
@@ -1300,6 +1590,44 @@ def render_analytics(state: dict, trades_df: pd.DataFrame, wfv: dict):
     sc4.metric("Profit Factor", f"{pf:.2f}")
     sc5.metric("Max DD", f"{max_dd:.2f}%")
 
+    # 5m vs HTF breakdown
+    if "best_tf" in df.columns:
+        st.markdown("---")
+        st.subheader("Scan Origin: 5m (WS) vs HTF (Hourly)")
+        df_5m = df[df["best_tf"] == "5m"]
+        df_htf = df[df["best_tf"] != "5m"]
+
+        oc1, oc2 = st.columns(2)
+        with oc1:
+            st.markdown("**5m WS Trades** (inter-hour WebSocket scan)")
+            if len(df_5m) > 0:
+                w5 = (df_5m["pnl_usd"] > 0).sum()
+                wr5 = w5 / len(df_5m) * 100
+                pnl5 = df_5m["pnl_usd"].sum()
+                avg5 = df_5m["pnl_pct"].mean()
+                m5a, m5b, m5c, m5d = st.columns(4)
+                m5a.metric("Trades", f"{len(df_5m)}")
+                m5b.metric("Win Rate", f"{wr5:.1f}%")
+                m5c.metric("PnL", f"${pnl5:+,.2f}")
+                m5d.metric("Avg PnL%", f"{avg5:+.2f}%")
+            else:
+                st.caption("No 5m trades yet")
+
+        with oc2:
+            st.markdown("**HTF Trades** (hourly full-TF scan)")
+            if len(df_htf) > 0:
+                wh = (df_htf["pnl_usd"] > 0).sum()
+                wrh = wh / len(df_htf) * 100
+                pnlh = df_htf["pnl_usd"].sum()
+                avgh = df_htf["pnl_pct"].mean()
+                mha, mhb, mhc, mhd = st.columns(4)
+                mha.metric("Trades", f"{len(df_htf)}")
+                mhb.metric("Win Rate", f"{wrh:.1f}%")
+                mhc.metric("PnL", f"${pnlh:+,.2f}")
+                mhd.metric("Avg PnL%", f"{avgh:+.2f}%")
+            else:
+                st.caption("No HTF trades yet")
+
     # Distribution charts
     st.markdown("---")
     st.subheader("Trade Distribution")
@@ -1377,7 +1705,7 @@ def render_trade_history(trades_df: pd.DataFrame):
 
     # ── Filters ───────────────────────────────────────────────────────
     st.subheader("Trade History")
-    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+    fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
 
     with fc1:
         groups = sorted(df["group"].unique().tolist()) if "group" in df.columns else []
@@ -1395,6 +1723,8 @@ def render_trade_history(trades_df: pd.DataFrame):
         sel_exits = st.multiselect("Exit Reason", exit_reasons, default=exit_reasons, key="th_exits")
     with fc5:
         outcome = st.selectbox("Outcome", ["All", "Winners", "Losers"], key="th_outcome")
+    with fc6:
+        scan_source = st.selectbox("Scan Source", ["All", "5m (WS)", "HTF (Hourly)"], key="th_scan_src")
 
     # Apply filters
     sel_dir_vals = [dir_map.get(d, d) for d in sel_dirs]
@@ -1413,6 +1743,13 @@ def render_trade_history(trades_df: pd.DataFrame):
         df = df[df["pnl_pct"] > 0]
     elif outcome == "Losers":
         df = df[df["pnl_pct"] <= 0]
+
+    # Scan source filter (5m WS vs HTF hourly)
+    if "best_tf" in df.columns:
+        if scan_source == "5m (WS)":
+            df = df[df["best_tf"] == "5m"]
+        elif scan_source == "HTF (Hourly)":
+            df = df[df["best_tf"] != "5m"]
 
     if df.empty:
         st.warning("No trades match the selected filters.")
@@ -1532,12 +1869,16 @@ def render_trade_history(trades_df: pd.DataFrame):
     st.subheader("All Trades")
 
     display_cols = [
-        "trade_id", "asset", "group", "direction", "entry_ts", "exit_ts",
+        "trade_id", "asset", "group", "scan_source", "direction", "entry_ts", "exit_ts",
         "entry_price", "exit_price", "best_tf", "confidence", "pvt_r",
         "leverage", "exit_reason", "duration_hours", "pnl_pct", "pnl_usd",
     ]
-    cols_present = [c for c in display_cols if c in df.columns]
-    display_df = df[cols_present].sort_values("exit_ts", ascending=False).copy()
+    display_df = df.copy()
+    # Add scan source column
+    if "best_tf" in display_df.columns:
+        display_df["scan_source"] = display_df["best_tf"].apply(lambda tf: "WS-5m" if tf == "5m" else "Hourly")
+    cols_present = [c for c in display_cols if c in display_df.columns]
+    display_df = display_df[cols_present].sort_values("exit_ts", ascending=False).copy()
 
     if "direction" in display_df.columns:
         display_df["direction"] = display_df["direction"].apply(
@@ -1676,8 +2017,8 @@ def render_controls(state: dict):
 def main():
     with st.sidebar:
         st.markdown("### :lizard: Varanus Neo-Flow")
-        st.caption("Extended Dashboard v1.0")
-        st.markdown("33 assets | 3 groups | 4 TFs")
+        st.caption("Extended Dashboard v2.0 — 5m WS Scan")
+        st.markdown("33 assets | 3 groups | 4 TFs + 5m WS")
         st.markdown("---")
 
         if st.button("Refresh Now", use_container_width=True):
@@ -1692,7 +2033,7 @@ def main():
 
         if pid:
             st.markdown(":green_circle: **Bot Running**")
-            st.markdown(":antenna_bars: **Data Sync: Websocket**")
+            st.markdown(":antenna_bars: **5m WS + Hourly Scans**")
         else:
             st.markdown(":red_circle: **Bot Stopped**")
         if state.get("circuit_breaker"):
@@ -1712,6 +2053,16 @@ def main():
                 if count:
                     st.markdown(f'{group_badge(g)} **{count}** open', unsafe_allow_html=True)
 
+            # Scan source breakdown
+            st.markdown("---")
+            st.caption("Open by Scan Source")
+            n_5m_sb = sum(1 for p in positions.values() if p.get("best_tf") == "5m")
+            n_htf_sb = len(positions) - n_5m_sb
+            if n_5m_sb:
+                st.markdown(f'<span style="color:#f6c343">WS-5m:</span> **{n_5m_sb}**', unsafe_allow_html=True)
+            if n_htf_sb:
+                st.markdown(f'<span style="color:#39afd1">Hourly:</span> **{n_htf_sb}**', unsafe_allow_html=True)
+
     state = load_bot_state()
     prices = fetch_binance_prices()
     scan_log = load_scan_log()
@@ -1719,7 +2070,7 @@ def main():
     wfv = load_wfv()
 
     st.markdown("## :lizard: Varanus Neo-Flow Extended Dashboard")
-    st.caption("33 assets | Groups A (Majors) / B (Tech-AI) / C (Meme) | 4 timeframes")
+    st.caption("33 assets | Groups A (Majors) / B (Tech-AI) / C (Meme) | 4 TFs + 5m WebSocket Scan")
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         ":dart: Cockpit",
@@ -1730,10 +2081,27 @@ def main():
         ":zap: Controls",
     ])
 
+    @st.fragment(run_every=1.0)
+    def fast_cockpit():
+        # Load fresh data inside fragment for true real-time
+        f_state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+        f_prices = fetch_binance_prices()
+        render_cockpit(f_state, f_prices)
+
+    @st.fragment(run_every=1.0)
+    def fast_intelligence():
+        # Load fresh data inside fragment for true real-time
+        f_state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+        f_log = json.loads(SCAN_LOG_FILE.read_text()) if SCAN_LOG_FILE.exists() else {}
+        render_intelligence(f_state, f_log)
+        st.markdown("---")
+        _render_bot_scan_log(f_log)
+
+
     with tab1:
-        render_cockpit(state, prices)
+        fast_cockpit()
     with tab2:
-        render_intelligence(state, scan_log)
+        fast_intelligence()
     with tab3:
         render_charting(state, trades_df)
     with tab4:
@@ -1743,10 +2111,10 @@ def main():
     with tab6:
         render_controls(state)
 
-    # Sidebar Footer / Auto-Refresh
+    # Sidebar Footer / Auto-Refresh (Reduced for general UI)
     st.sidebar.markdown("---")
     st.sidebar.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
-    do_refresh = st.sidebar.checkbox("Auto Refresh (30s)", value=True)
+    do_refresh = st.sidebar.checkbox("Auto Refresh (Slow)", value=False)
     if do_refresh:
         time.sleep(30)
         st.rerun()

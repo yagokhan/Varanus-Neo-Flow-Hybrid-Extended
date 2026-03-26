@@ -367,6 +367,31 @@ def _get_exchange():
         })
     return _exchange
 
+def _fetch_order_commission(symbol: str, order_id: str) -> float:
+    """Fetch total commission paid for an order from Binance trade fills."""
+    try:
+        ex = _get_exchange()
+        trades = ex.fetch_my_trades(symbol, limit=50)
+        total_commission = 0.0
+        for t in trades:
+            if str(t.get("order")) == str(order_id):
+                fee = t.get("fee", {})
+                cost = float(fee.get("cost", 0))
+                # Convert to USDT if needed
+                if fee.get("currency") == "USDT":
+                    total_commission += cost
+                elif fee.get("currency") == "BNB":
+                    # Approximate BNB→USDT (discount fee)
+                    bnb_price = fetch_ticker_price("BNBUSDT") or 600.0
+                    total_commission += cost * bnb_price
+                else:
+                    total_commission += cost
+        return total_commission
+    except Exception as e:
+        logger.error("Failed to fetch commission for %s order %s: %s", symbol, order_id, e)
+        return 0.0
+
+
 def place_market_order(symbol: str, side: str, amount_usd: float, leverage: int):
     try:
         ex = _get_exchange()
@@ -397,6 +422,37 @@ def _stop_limit_price(stop_price: float, side: str) -> float:
         return stop_price * (1 + STOP_LIMIT_BUFFER)
 
 
+def _cancel_all_algo_orders(symbol: str):
+    """Cancel all algo/conditional orders for a symbol (STOP, TP, etc.).
+    These live in Binance's algo system, separate from regular orders."""
+    try:
+        ex = _get_exchange()
+        result = ex.fapiPrivateGetOpenAlgoOrders()
+        orders = result if isinstance(result, list) else result.get("orders", [])
+        cancelled = 0
+        for o in orders:
+            if o.get("symbol") == symbol.replace("/", "").replace(":USDT", ""):
+                try:
+                    ex.fapiPrivateDeleteAlgoOrder({"algoId": int(o["algoId"])})
+                    cancelled += 1
+                except Exception:
+                    pass
+        if cancelled:
+            logger.info("Cancelled %d algo orders for %s", cancelled, symbol)
+    except Exception as e:
+        logger.error("Failed to cancel algo orders for %s: %s", symbol, e)
+
+
+def _cancel_all_orders_full(symbol: str):
+    """Cancel BOTH regular and algo/conditional orders for a symbol."""
+    ex = _get_exchange()
+    try:
+        ex.cancel_all_orders(symbol)
+    except Exception:
+        pass
+    _cancel_all_algo_orders(symbol)
+
+
 def place_stop_loss(symbol: str, side: str, quantity: float, stop_price: float):
     try:
         ex = _get_exchange()
@@ -415,7 +471,7 @@ def update_stop_loss(symbol: str, side: str, quantity: float, new_stop: float, o
     """Cancel old stop and place a new STOP_LIMIT at the tightened trail price. Returns new order ID."""
     try:
         ex = _get_exchange()
-        ex.cancel_all_orders(symbol)
+        _cancel_all_orders_full(symbol)
         new_stop = float(ex.price_to_precision(symbol, new_stop))
         limit_price = float(ex.price_to_precision(symbol, _stop_limit_price(new_stop, side)))
         order = ex.create_order(symbol, "STOP", side, quantity, limit_price,
@@ -480,19 +536,25 @@ class LivePosition:
     sl_order_id: str = ""
     last_bar_ns: int = 0
     xgb_prob: float = 0.0
+    entry_commission: float = 0.0
+
+REENTRY_COOLDOWN_SECONDS = 3600  # 1 hour cooldown after closing a position
 
 @dataclass
-class BotState:
-    positions: dict = field(default_factory=dict)
+class LiveState:
+    positions: dict[str, LivePosition] = field(default_factory=dict)
     trade_counter: int = 0
     realized_pnl: float = 0.0
-    initial_capital: float = 10_000.0
-    peak_equity: float = 10_000.0
+    initial_capital: float = 1000.0
+    peak_equity: float = 1000.0
     circuit_breaker: bool = False
     last_scan_ts: str = ""
     total_scans: int = 0
+    current_scanning_asset: str = "" # Track which asset is active right now
+    closed_cooldowns: dict[str, str] = field(default_factory=dict)  # asset -> ISO timestamp of last close
 
-def save_state(state: BotState):
+
+def save_state(state: LiveState):
     data = {
         "trade_counter": state.trade_counter,
         "realized_pnl": state.realized_pnl,
@@ -501,12 +563,14 @@ def save_state(state: BotState):
         "circuit_breaker": state.circuit_breaker,
         "last_scan_ts": state.last_scan_ts,
         "total_scans": state.total_scans,
-        "positions": {k: asdict(v) for k, v in state.positions.items()},
+        "current_scanning_asset": state.current_scanning_asset,
+        "closed_cooldowns": state.closed_cooldowns,
+        "positions": {a: asdict(p) for a, p in state.positions.items()},
     }
     STATE_FILE.write_text(json.dumps(data, indent=2, default=str))
 
-def load_state() -> BotState:
-    state = BotState()
+def load_state() -> LiveState:
+    state = LiveState()
     if STATE_FILE.exists():
         try:
             data = json.loads(STATE_FILE.read_text())
@@ -517,8 +581,10 @@ def load_state() -> BotState:
             state.circuit_breaker = data.get("circuit_breaker", False)
             state.last_scan_ts = data.get("last_scan_ts", "")
             state.total_scans = data.get("total_scans", 0)
-            for k, v in data.get("positions", {}).items():
-                state.positions[k] = LivePosition(**v)
+            state.current_scanning_asset = data.get("current_scanning_asset", "")
+            state.closed_cooldowns = data.get("closed_cooldowns", {})
+            for asset, pos_data in data.get("positions", {}).items():
+                state.positions[asset] = LivePosition(**pos_data)
         except Exception as e:
             logger.error("Failed to load state: %s", e)
     return state
@@ -559,6 +625,9 @@ class LiveExtendedBot:
         self.consensus = _load_consensus_params()
         self.group_thresholds = _load_group_thresholds()
         self._apply_consensus()
+        # 5m scan batch accumulator — collects results across all 33 asset callbacks per cycle
+        self._ws_scan_batch = []
+        self._ws_scan_batch_ts = ""
         logger.info("Bot initialized — mode=%s, capital=$%.0f, assets=%d, groups=3",
                     "LIVE" if live_mode else "DRY-RUN", self.state.initial_capital, len(ASSETS))
         logger.info("Consensus params: %s", self.consensus)
@@ -588,6 +657,23 @@ class LiveExtendedBot:
             ae.TRAIL_BUFFER_STD = gt.trail_buffer
             ae.TREND_EXHAUST_R = gt.exhaust_r
 
+    def _is_on_cooldown(self, asset: str) -> bool:
+        """Check if asset is still in re-entry cooldown after a recent close."""
+        ts_str = self.state.closed_cooldowns.get(asset)
+        if not ts_str:
+            return False
+        try:
+            closed_at = datetime.fromisoformat(ts_str)
+            elapsed = (datetime.now(timezone.utc) - closed_at).total_seconds()
+            if elapsed < REENTRY_COOLDOWN_SECONDS:
+                logger.debug("[%s] Re-entry cooldown: %ds remaining", asset, int(REENTRY_COOLDOWN_SECONDS - elapsed))
+                return True
+            # Cooldown expired — clean up
+            del self.state.closed_cooldowns[asset]
+        except Exception:
+            pass
+        return False
+
     def _check_circuit_breaker(self) -> bool:
         equity = self.state.initial_capital + self.state.realized_pnl
         if equity > self.state.peak_equity:
@@ -611,7 +697,7 @@ class LiveExtendedBot:
             # Profit exits → limit order (better price)
             use_market = reason in ("HARD_SL_HIT", "ADAPTIVE_TRAIL_HIT")
             try:
-                _get_exchange().cancel_all_orders(pos.symbol)
+                _cancel_all_orders_full(pos.symbol)
                 order = close_position(pos.symbol, side, pos.quantity, exit_price, use_market=use_market)
                 if order is None:
                     logger.error("CLOSE RETURNED NONE for %s — keeping position in state", pos.asset)
@@ -627,8 +713,25 @@ class LiveExtendedBot:
                 return  # don't remove position, don't record PnL
         pnl_pct = (actual_exit_price - pos.entry_price) / pos.entry_price * pos.direction * 100.0 * pos.leverage
         pnl_usd = pnl_pct / 100.0 * pos.position_usd
+        # Fetch real commissions from Binance fills
+        exit_commission = 0.0
+        if self.live_mode:
+            exit_order_id = ""
+            if order is not None:
+                exit_order_id = str(order.get("id", ""))
+            if exit_order_id:
+                exit_commission = _fetch_order_commission(pos.symbol, exit_order_id)
+            total_commission = pos.entry_commission + exit_commission
+            pnl_usd -= total_commission
+            logger.info("COMMISSION %s: entry=$%.4f exit=$%.4f total=$%.4f",
+                        pos.asset, pos.entry_commission, exit_commission, total_commission)
+        else:
+            total_commission = 0.0
+        net_pnl_pct = pnl_usd / pos.position_usd * 100.0 if pos.position_usd > 0 else pnl_pct
         self.state.realized_pnl += pnl_usd
         del self.state.positions[pos.asset]
+        # Set cooldown to prevent immediate re-entry
+        self.state.closed_cooldowns[pos.asset] = now.isoformat()
         save_state(self.state)
         entry_dt = datetime.fromisoformat(pos.entry_ts)
         dur = (now - entry_dt).total_seconds() / 3600
@@ -636,23 +739,27 @@ class LiveExtendedBot:
             "trade_id": pos.trade_id, "asset": pos.asset, "group": pos.group,
             "direction": "LONG" if pos.direction == 1 else "SHORT",
             "entry_ts": pos.entry_ts, "exit_ts": now.isoformat(), "entry_price": pos.entry_price,
-            "exit_price": exit_price, "best_tf": pos.best_tf, "best_period": pos.best_period,
+            "exit_price": actual_exit_price, "best_tf": pos.best_tf, "best_period": pos.best_period,
             "confidence": pos.confidence, "pvt_r": pos.pvt_r, "leverage": pos.leverage,
             "position_usd": pos.position_usd, "hard_sl": pos.hard_sl, "exit_reason": reason,
-            "bars_held": pos.bars_held, "duration_hours": round(dur, 2), "pnl_pct": round(pnl_pct, 4),
+            "bars_held": pos.bars_held, "duration_hours": round(dur, 2), "pnl_pct": round(net_pnl_pct, 4),
             "pnl_usd": round(pnl_usd, 2), "peak_r": round(pos.peak_r, 4),
+            "entry_commission": round(pos.entry_commission, 4),
+            "exit_commission": round(exit_commission, 4),
+            "total_commission": round(total_commission, 4),
         }
         df = pd.DataFrame([trade_log])
         df.to_csv(TRADES_FILE, mode="a", header=not TRADES_FILE.exists(), index=False)
-        emoji = "+" if pnl_usd > 0 else "-"
         grp = pos.group
+        fee_str = f" | Fees: ${total_commission:.2f}" if self.live_mode else ""
         msg = (
             f"<b>CLOSED {pos.asset}</b> [Grp {grp}] — {reason}\n"
-            f"PnL: <b>{pnl_pct:+.2f}%</b> (${pnl_usd:+,.2f})\n"
+            f"PnL: <b>{net_pnl_pct:+.2f}%</b> (${pnl_usd:+,.2f}){fee_str}\n"
             f"Duration: {dur:.1f}h | TF: {pos.best_tf}"
         )
-        logger.info("CLOSED %s %s [%s]: PnL %+.2f%% ($%+.2f) | %s",
-                    "LONG" if pos.direction == 1 else "SHORT", pos.asset, grp, pnl_pct, pnl_usd, reason)
+        logger.info("CLOSED %s %s [%s]: Net PnL %+.2f%% ($%+.2f) | Fees: $%.2f | %s",
+                    "LONG" if pos.direction == 1 else "SHORT", pos.asset, grp,
+                    net_pnl_pct, pnl_usd, total_commission, reason)
         tg_send(msg)
 
     def _refresh_position_data(self):
@@ -779,6 +886,9 @@ class LiveExtendedBot:
         for asset in ASSETS:
             if asset in self.state.positions or asset in skip_assets:
                 scan_log["signals"].append({"asset": asset, "status": "in_position" if asset in self.state.positions else "just_closed"})
+                continue
+            if self._is_on_cooldown(asset):
+                scan_log["signals"].append({"asset": asset, "status": "cooldown"})
                 continue
             if len(self.state.positions) >= MAX_CONCURRENT:
                 scan_log["signals"].append({"asset": asset, "status": "max_positions"})
@@ -922,8 +1032,10 @@ class LiveExtendedBot:
             else:
                 trail_sl = max(price, signal.midline + trail_buffer * std_price)
 
-            quantity, order_id, sl_order_id = 0.0, "", ""
+            quantity, order_id, sl_order_id, entry_commission = 0.0, "", "", 0.0
             if self.live_mode:
+                # Cancel any lingering orders for this symbol before entering
+                _cancel_all_orders_full(f"{asset}USDT")
                 side = "buy" if signal.direction == 1 else "sell"
                 order = place_market_order(f"{asset}USDT", side, pos_usd, lev)
                 if not order:
@@ -934,6 +1046,8 @@ class LiveExtendedBot:
                 if quantity <= 0:
                     logger.error("ORDER FILLED qty=0 for %s — skipping position", asset)
                     continue
+                entry_commission = _fetch_order_commission(f"{asset}USDT", order_id)
+                logger.info("ENTRY COMMISSION %s: $%.4f", asset, entry_commission)
                 sl_order = place_stop_loss(f"{asset}USDT", "sell" if signal.direction == 1 else "buy", quantity, hard_sl)
                 if sl_order:
                     sl_order_id = str(sl_order.get("id", ""))
@@ -947,7 +1061,7 @@ class LiveExtendedBot:
                 best_tf=signal.best_tf, best_period=signal.best_period, confidence=signal.confidence,
                 pvt_r=signal.pvt_r, leverage=lev, position_usd=pos_usd, quantity=quantity,
                 peak_r=signal.confidence, order_id=order_id, sl_order_id=sl_order_id,
-                last_bar_ns=scan_ns, xgb_prob=xgb_prob,
+                last_bar_ns=scan_ns, xgb_prob=xgb_prob, entry_commission=entry_commission,
             )
             self.state.positions[asset] = pos
             save_state(self.state)
@@ -1110,6 +1224,18 @@ class LiveExtendedBot:
 
         tg_send("\n".join(lines))
 
+    def _flush_ws_scan_log(self):
+        """Write accumulated 5m scan batch to scan_results.json for dashboard."""
+        try:
+            ws_log = {
+                "timestamp": self._ws_scan_batch_ts,
+                "scan_number": self.state.total_scans,
+                "signals": list(self._ws_scan_batch),
+            }
+            SCAN_LOG_FILE.write_text(json.dumps(ws_log, indent=2))
+        except Exception:
+            pass
+
     def scan_5m_asset(self, asset: str):
         """Run full physics+XGBoost pipeline for one asset on 5m data.
         Called by websocket thread on each closed 5m candle."""
@@ -1119,71 +1245,122 @@ class LiveExtendedBot:
         with self.lock:
             if self.state.circuit_breaker:
                 return
-            if asset in self.state.positions:
-                return
-            if len(self.state.positions) >= MAX_CONCURRENT:
-                return
+
+            now = datetime.now(timezone.utc)
+            now_str = f"{now.strftime('%H:%M:%S')} (WS-5m)"
+
+            # Reset batch if this is a new 5m cycle (timestamp changed)
+            if self._ws_scan_batch_ts != now_str:
+                self._ws_scan_batch = []
+                self._ws_scan_batch_ts = now_str
+
+            # Set currently scanning asset for dashboard
+            self.state.current_scanning_asset = asset
+            self.state.last_scan_ts = now.isoformat()
+            save_state(self.state)
 
             group = get_group(asset)
             gt = self.group_thresholds.get(group, DEFAULT_THRESHOLDS.get(group))
+
+            if asset in self.state.positions:
+                self._ws_scan_batch.append({"asset": asset, "group": group, "status": "in_position", "tf": "5m",
+                                            "confidence": 0, "pvt_r": 0, "xgb_prob": 0, "detail": ""})
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
+                self._flush_ws_scan_log()
+                return
+
+            if self._is_on_cooldown(asset):
+                self._ws_scan_batch.append({"asset": asset, "group": group, "status": "cooldown", "tf": "5m",
+                                            "confidence": 0, "pvt_r": 0, "xgb_prob": 0, "detail": ""})
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
+                self._flush_ws_scan_log()
+                return
+
             self._apply_group_params(asset)
 
             asset_data = _cached_data.get(asset)
             if not asset_data:
+                self._ws_scan_batch.append({"asset": asset, "group": group, "status": "no_data", "tf": "5m",
+                                            "confidence": 0, "pvt_r": 0, "xgb_prob": 0, "detail": ""})
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
+                self._flush_ws_scan_log()
                 return
 
-            now = datetime.now(timezone.utc)
             scan_ns = int(now.timestamp() * 1_000_000_000)
-            
-            # Update state timestamp so dashboard knows a 5m scan happened
-            self.state.last_scan_ts = now.isoformat()
-            save_state(self.state)
 
-            # Update SCAN_LOG_FILE so dashboard shows this 5m activity
-            try:
-                ws_scan_log = {
-                    "timestamp": f"{now.strftime('%H:%M:%S')} (WS-5m)",
-                    "scan_number": self.state.total_scans,
-                    "signals": [{"asset": asset, "status": "scanning", "tf": "5m"}]
-                }
-                SCAN_LOG_FILE.write_text(json.dumps(ws_scan_log, indent=2))
-            except Exception:
-                pass
+            def _record(status, detail="", r=0.0, pvt_r=0.0, xgb=0.0):
+                self._ws_scan_batch.append({
+                    "asset": asset, "group": group, "status": status, "detail": detail,
+                    "confidence": round(r, 4), "pvt_r": round(pvt_r, 4), "xgb_prob": round(xgb, 4),
+                    "tf": best.timeframe if best else "5m",
+                })
+                self._flush_ws_scan_log()
 
+            best, all_results = None, []
             scan_dfs = build_scan_dataframes(asset_data, scan_ns - 1, scan_tfs=["5m"])
             df_4h = build_htf_dataframe(asset_data, scan_ns - 14400 * 10**9)
             if not scan_dfs or df_4h is None:
+                _record("no_data")
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
                 return
 
             best, all_results = find_best_regression(scan_dfs)
             if not best:
+                _record("no_regression")
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
                 return
 
             abs_r = abs(best.pearson_r)
             direction = 1 if best.slope < 0 else -1
             min_r = gt.min_confidence if gt else self.consensus["min_pearson_r"]
             if abs_r < min_r:
+                _record("weak_r", f"R={abs_r:.4f}<{min_r:.2f}", r=abs_r)
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
                 return
 
             best_df_7d = trim_to_7d(scan_dfs[best.timeframe], best.timeframe)
             pvt = compute_pvt_regression(best_df_7d, best.period)
             min_pvt_r = gt.min_pvt_r if gt else self.consensus["min_pvt_r"]
-            pvt_passes, _ = check_pvt_alignment(direction, abs_r, pvt, min_pvt_r)
+            pvt_passes, pvt_reason = check_pvt_alignment(direction, abs_r, pvt, min_pvt_r)
+            pvt_r_val = abs(pvt.pearson_r) if pvt else 0.0
             if not pvt_passes:
+                _record("pvt_rejected", pvt_reason, r=abs_r, pvt_r=pvt_r_val)
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
                 return
 
             htf_bias = get_htf_bias(df_4h)
-            if htf_bias == 0 or htf_bias != direction:
+            if htf_bias == 0:
+                _record("htf_neutral", "4H neutral", r=abs_r, pvt_r=pvt_r_val)
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
+                return
+            if htf_bias != direction:
+                _record("htf_conflict", f"sig={direction}, htf={htf_bias}", r=abs_r, pvt_r=pvt_r_val)
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
                 return
 
             cg_thresh = gt.combined_gate if gt else self.consensus["combined_gate"]
             if not check_combined_gate(direction, all_results, cg_thresh):
+                _record("combined_gate_blocked", f"opposing>{cg_thresh:.2f}", r=abs_r, pvt_r=pvt_r_val)
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
                 return
 
             signal = scan_asset(asset, scan_dfs, df_4h,
                                 min_pearson_r=min_r, min_pvt_r=min_pvt_r,
                                 combined_gate_threshold=cg_thresh, group=group)
             if not signal:
+                _record("physics_rejected_final", r=abs_r, pvt_r=pvt_r_val)
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
                 return
 
             xgb_prob = predict_probability(
@@ -1192,10 +1369,17 @@ class LiveExtendedBot:
             )
             xgb_threshold = gt.min_xgb_score if gt else 0.55
             if xgb_prob < xgb_threshold:
-                logger.info("[WS-5m][%s][Grp%s] XGB REJECTED: prob=%.4f <= %.2f",
-                            asset, group, xgb_prob, xgb_threshold)
+                _record("xgb_rejected", f"prob={xgb_prob:.4f}<{xgb_threshold}", r=abs_r, pvt_r=pvt_r_val, xgb=xgb_prob)
+                self.state.current_scanning_asset = ""
+                save_state(self.state)
                 return
 
+            # All 5 gates passed — entry!
+            _record("entered", f"XGB={xgb_prob:.4f}", r=abs_r, pvt_r=pvt_r_val, xgb=xgb_prob)
+            self.state.current_scanning_asset = ""
+            save_state(self.state)
+
+            # --- ENTRY EXECUTION ---
             price = signal.entry_price if not self.live_mode else (fetch_ticker_price(f"{asset}USDT") or signal.entry_price)
             lev = get_leverage(signal.confidence)
             vol_scalar = 0.75 if asset in HIGH_VOL_ASSETS else 1.0
@@ -1213,8 +1397,10 @@ class LiveExtendedBot:
             else:
                 trail_sl = max(price, signal.midline + trail_buffer * std_price)
 
-            quantity, order_id, sl_order_id = 0.0, "", ""
+            quantity, order_id, sl_order_id, entry_commission = 0.0, "", "", 0.0
             if self.live_mode:
+                # Cancel any lingering orders for this symbol before entering
+                _cancel_all_orders_full(f"{asset}USDT")
                 side = "buy" if signal.direction == 1 else "sell"
                 order = place_market_order(f"{asset}USDT", side, pos_usd, lev)
                 if not order:
@@ -1225,6 +1411,8 @@ class LiveExtendedBot:
                 if quantity <= 0:
                     logger.error("ORDER FILLED qty=0 for %s — skipping", asset)
                     return
+                entry_commission = _fetch_order_commission(f"{asset}USDT", order_id)
+                logger.info("ENTRY COMMISSION %s: $%.4f", asset, entry_commission)
                 sl_order = place_stop_loss(f"{asset}USDT",
                     "sell" if signal.direction == 1 else "buy", quantity, hard_sl)
                 if sl_order:
@@ -1239,16 +1427,25 @@ class LiveExtendedBot:
                 best_tf=signal.best_tf, best_period=signal.best_period, confidence=signal.confidence,
                 pvt_r=signal.pvt_r, leverage=lev, position_usd=pos_usd, quantity=quantity,
                 peak_r=signal.confidence, order_id=order_id, sl_order_id=sl_order_id,
-                last_bar_ns=scan_ns, xgb_prob=xgb_prob,
+                last_bar_ns=scan_ns, xgb_prob=xgb_prob, entry_commission=entry_commission,
             )
             self.state.positions[asset] = pos
             save_state(self.state)
 
-            # Update SCAN_LOG_FILE for dashboard (5m WebSocket update)
+            dir_str = "LONG" if signal.direction == 1 else "SHORT"
+            logger.info("[WS-5m] NEW %s — %s [Grp%s] | R:%.4f | XGB:%.4f | $%.0f",
+                        dir_str, asset, group, signal.confidence, xgb_prob, pos_usd)
+            tg_send(
+                f"<b>NEW {dir_str} — {asset}</b> [Grp {group}] (5m WS)\n"
+                f"XGB: {xgb_prob:.4f} | R: {signal.confidence:.4f}\n"
+                f"Size: ${pos_usd:,.0f} | Lev: {lev}x | SL: ${hard_sl:.4f}\n"
+                f"TF: {signal.best_tf} | Period: {signal.best_period}"
+            )
+
+            # Write WS scan log for dashboard
             try:
-                # We create a single-asset scan log entry so the dashboard knows what just happened
                 ws_scan_log = {
-                    "timestamp": f"{now.isoformat()} (WS-5m)",
+                    "timestamp": f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} (WS-5m)",
                     "scan_number": self.state.total_scans,
                     "signals": [{
                         "asset": asset, "group": group, "status": "entered",
@@ -1260,16 +1457,6 @@ class LiveExtendedBot:
                 SCAN_LOG_FILE.write_text(json.dumps(ws_scan_log, indent=2))
             except Exception as e:
                 logger.error("Failed to write WS scan log: %s", e)
-
-            dir_str = "LONG" if signal.direction == 1 else "SHORT"
-            logger.info("[WS-5m] NEW %s — %s [Grp%s] | R:%.4f | XGB:%.4f | $%.0f",
-                        dir_str, asset, group, signal.confidence, xgb_prob, pos_usd)
-            tg_send(
-                f"<b>NEW {dir_str} — {asset}</b> [Grp {group}] (5m WS)\n"
-                f"XGB: {xgb_prob:.4f} | R: {signal.confidence:.4f}\n"
-                f"Size: ${pos_usd:,.0f} | Lev: {lev}x | SL: ${hard_sl:.4f}\n"
-                f"TF: {signal.best_tf} | Period: {signal.best_period}"
-            )
 
     def send_status(self):
         with self.lock:
@@ -1328,7 +1515,12 @@ def start_websocket_stream(bot: "LiveExtendedBot"):
                     ts_ms=int(k["t"])
                 )
                 logger.debug("WS BAR RECEIVED: %s %s @ %.4f", asset, k["i"], float(k["c"]))
-                # Run physics+XGBoost scan on this asset (matches backtest behavior)
+                # Process exits on every 5m bar (matches backtest: trail/SL checks per bar)
+                with bot.lock:
+                    if bot.state.positions:
+                        bot._refresh_position_data()
+                        bot._process_sub_bars()
+                # Run physics+XGBoost scan on this asset for new entries
                 bot.scan_5m_asset(asset)
         except Exception as e:
             logger.error("Websocket message error: %s", e)
@@ -1385,6 +1577,11 @@ def start_price_monitor(bot: LiveExtendedBot):
     def _monitor():
         while True:
             try:
+                # Always update timestamp to show bot is ALIVE every 30s
+                with bot.lock:
+                    bot.state.last_scan_ts = datetime.now(timezone.utc).isoformat()
+                    save_state(bot.state)
+
                 if bot.state.positions:
                     n_pos = len(bot.state.positions)
                     logger.debug("Monitor heartbeat: Checking %d positions", n_pos)
@@ -1483,6 +1680,10 @@ def main():
     # On live mode, verify no orphaned Binance positions before starting
     if args.live and not args.once:
         _check_binance_sync(bot)
+
+    # Pre-load data cache so 5m WS scans work immediately (not just after first hourly cycle)
+    logger.info("Pre-loading data cache for immediate 5m WS scanning...")
+    get_live_data()
 
     start_telegram_listener(bot)
     start_price_monitor(bot)

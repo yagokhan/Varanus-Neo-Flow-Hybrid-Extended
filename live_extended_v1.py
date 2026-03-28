@@ -658,6 +658,8 @@ class LivePosition:
     p_entry_threshold: float = 0.0
     p_exit_threshold: float = 0.0
     matrix_leverage: int = 0
+    recent_rs: list[float] = field(default_factory=list)
+    hard_sl_pct: float = 0.015
 
 
 @dataclass
@@ -738,11 +740,13 @@ class PercentileCalculator:
     def __init__(self, xgb_model: xgb.XGBClassifier):
         self.xgb_model = xgb_model
         self._distributions: dict[str, np.ndarray] = {}  # key = "5m", "30m", etc.
+        self._r_distributions: dict[str, np.ndarray] = {}
         self._build_distributions()
 
     def _find_trade_csvs(self) -> list[Path]:
         """Find available trade log CSVs in priority order."""
         candidates = [
+            BASE_DIR / "blind_test_v1_extended_trades.csv",
             BASE_DIR / "validation_trades.csv",
             BASE_DIR / "blind_test_trades.csv",
             BASE_DIR / "extended_trades_hybrid.csv",
@@ -764,7 +768,7 @@ class PercentileCalculator:
             try:
                 df = pd.read_csv(path)
                 df.columns = [c.strip().lower() for c in df.columns]
-                required = {"confidence", "pvt_r", "best_tf", "best_period", "group"}
+                required = {"confidence", "pvt_r", "best_tf", "best_period"}
                 if required.issubset(set(df.columns)):
                     frames.append(df)
                     logger.info("PercentileCalculator: Loaded %s (%d trades)", path.name, len(df))
@@ -806,10 +810,12 @@ class PercentileCalculator:
         for tf in SCAN_TIMEFRAMES:
             mask = combined["best_tf"] == tf
             scores = combined.loc[mask, "xgb_score"].values
+            r_scores = combined.loc[mask, "confidence"].values
+            
             if len(scores) >= 10:
                 self._distributions[tf] = np.sort(scores)
                 tf_params = TF_MATRIX.get(tf, {})
-                logger.info("  TF %s: %d trades | P15=%.4f P20=%.4f P30=%.4f P70=%.4f P75=%.4f P80=%.4f",
+                logger.info("  TF %s XGB: %d trades | P15=%.4f P20=%.4f P30=%.4f P70=%.4f P75=%.4f P80=%.4f",
                             tf, len(scores),
                             np.percentile(scores, 15),
                             np.percentile(scores, 20),
@@ -817,14 +823,20 @@ class PercentileCalculator:
                             np.percentile(scores, 70),
                             np.percentile(scores, 75),
                             np.percentile(scores, 80))
-            else:
-                logger.info("  TF %s: only %d trades (< 10), will use global fallback", tf, len(scores))
+            
+            if len(r_scores) >= 10:
+                self._r_distributions[tf] = np.sort(r_scores)
+                logger.info("  TF %s R: %d trades | P80=%.4f", tf, len(r_scores), np.percentile(r_scores, 80))
 
         # Global fallback (all TFs combined)
         all_scores = combined["xgb_score"].values
         if len(all_scores) >= 10:
             self._distributions["GLOBAL"] = np.sort(all_scores)
             logger.info("  GLOBAL fallback: %d trades", len(all_scores))
+            
+        all_r = combined["confidence"].values
+        if len(all_r) >= 10:
+            self._r_distributions["GLOBAL"] = np.sort(all_r)
 
     def get_threshold(self, tf: str, percentile: float) -> float:
         """
@@ -850,10 +862,22 @@ class PercentileCalculator:
                         tf, percentile)
         return percentile
 
+    def get_r_threshold(self, tf: str, percentile: float) -> float:
+        """Get the actual Pearson R threshold for a given percentile."""
+        if tf in self._r_distributions:
+            return float(np.percentile(self._r_distributions[tf], percentile * 100))
+        if "GLOBAL" in self._r_distributions:
+            return float(np.percentile(self._r_distributions["GLOBAL"], percentile * 100))
+        return 0.80
+
     def get_entry_threshold(self, group: str, tf: str) -> float:
         """Get the entry XGB threshold for a TF from TF_MATRIX. Group accepted but ignored."""
         params = _get_matrix_params(group, tf)
-        return self.get_threshold(tf, params["entry_p"])
+        entry_p = params["entry_p"]
+        # Rule: Group A Majors 5m/30m Entry Gate = P90
+        if group == "A" and tf in ["5m", "30m"]:
+            entry_p = 0.90
+        return self.get_threshold(tf, entry_p)
 
     def get_exit_threshold(self, group: str, tf: str) -> float:
         """Get the exit XGB threshold (P-Floor) for a TF from TF_MATRIX. Group accepted but ignored."""
@@ -1075,7 +1099,7 @@ class SignalAuditor:
                 "r": round(signal_obj.confidence, 4), "pvt_r": round(signal_obj.pvt_r, 4),
                 "tf": signal_obj.best_tf, "period": signal_obj.best_period,
                 "rejected_at": "P-MATRIX",
-                "detail": f"XGB={xgb_prob:.4f} < entry_P{matrix_params['entry_p']*100:.0f}={entry_threshold:.4f}",
+                "detail": f"XGB={xgb_prob:.4f} < entry_threshold={entry_threshold:.4f}",
                 "xgb_prob": round(xgb_prob, 4),
             }
             return {
@@ -1084,6 +1108,26 @@ class SignalAuditor:
                 "matrix_leverage": matrix_leverage, "near_miss": near_miss,
                 "reason": "p_matrix_rejected",
             }
+
+        # Rule: LONG Confirmation — both XGB and Pearson R must be above P80
+        if signal_obj.direction == 1:
+            p80_xgb = self.percentile_calc.get_threshold(signal_obj.best_tf, 0.80)
+            p80_r = self.percentile_calc.get_r_threshold(signal_obj.best_tf, 0.80)
+            if xgb_prob < p80_xgb or signal_obj.confidence < p80_r:
+                near_miss = {
+                    "asset": asset, "group": group, "dir": "LONG",
+                    "r": round(signal_obj.confidence, 4), "pvt_r": round(signal_obj.pvt_r, 4),
+                    "tf": signal_obj.best_tf, "period": signal_obj.best_period,
+                    "rejected_at": "LONG_CONF",
+                    "detail": f"LONG rule: XGB({xgb_prob:.4f}) < P80({p80_xgb:.4f}) OR R({signal_obj.confidence:.4f}) < P80({p80_r:.4f})",
+                    "xgb_prob": round(xgb_prob, 4),
+                }
+                return {
+                    "passed": False, "signal": signal_obj, "xgb_prob": xgb_prob,
+                    "entry_threshold": entry_threshold, "exit_threshold": exit_threshold,
+                    "matrix_leverage": matrix_leverage, "near_miss": near_miss,
+                    "reason": "long_confirmation_failed",
+                }
 
         return {
             "passed": True, "signal": signal_obj, "xgb_prob": xgb_prob,
@@ -1156,17 +1200,18 @@ class RiskEngine:
 
     def check_hard_sl(self, pos: LivePosition, current_price: float) -> tuple[bool, str]:
         """
-        Global 1.5% hard SL check — emergency circuit breaker per position.
+        Global 1.5% hard SL check (or 1.8% for Group A 4h).
         Returns (should_exit, reason).
         """
+        sl_pct = pos.hard_sl_pct
         if pos.direction == 1:
             pnl_pct = (current_price - pos.entry_price) / pos.entry_price
-            if pnl_pct <= -HARD_SL_PCT:
-                return True, f"HARD_SL_1.5%: price={current_price:.6f} pnl={pnl_pct*100:.2f}%"
+            if pnl_pct <= -sl_pct:
+                return True, f"HARD_SL_{sl_pct*100:.1f}%: price={current_price:.6f} pnl={pnl_pct*100:.2f}%"
         else:
             pnl_pct = (pos.entry_price - current_price) / pos.entry_price
-            if pnl_pct <= -HARD_SL_PCT:
-                return True, f"HARD_SL_1.5%: price={current_price:.6f} pnl={pnl_pct*100:.2f}%"
+            if pnl_pct <= -sl_pct:
+                return True, f"HARD_SL_{sl_pct*100:.1f}%: price={current_price:.6f} pnl={pnl_pct*100:.2f}%"
         return False, ""
 
     def check_circuit_breaker(self, state: LiveState) -> bool:
@@ -1400,10 +1445,15 @@ class TradeManager:
             return None
 
         # Hard SL: 1.5% from entry (global rule)
+        sl_pct = HARD_SL_PCT
+        if group == "A" and signal.best_tf == "4h":
+            sl_pct = 0.018 # 1.8% buffer for Group A Trends
+            logger.info("HARD SL BUFFER: %s 4h Majors set to %.1f%%", asset, sl_pct * 100)
+
         if signal.direction == 1:
-            hard_sl = price * (1 - HARD_SL_PCT)
+            hard_sl = price * (1 - sl_pct)
         else:
-            hard_sl = price * (1 + HARD_SL_PCT)
+            hard_sl = price * (1 + sl_pct)
 
         # Adaptive trail initial (preserved for sub-bar tracking)
         trail_buffer = gt.trail_buffer if gt else self.consensus["trail_buffer"]
@@ -1457,6 +1507,8 @@ class TradeManager:
             p_entry_threshold=entry_threshold,
             p_exit_threshold=exit_threshold,
             matrix_leverage=matrix_leverage,
+            recent_rs=[signal.confidence],
+            hard_sl_pct=sl_pct,
         )
         self.state.positions[asset] = pos
         save_state(self.state)
@@ -1557,7 +1609,7 @@ class TradeManager:
                 bar_low = float(ad.low[idx])
                 bar_close = float(ad.close[idx])
 
-                # 1. Hard SL check (1.5% from entry)
+                # 1. Hard SL check (dynamic pct from entry)
                 current_price = bar_close
                 if pos.direction == 1:
                     current_price = bar_low
@@ -1566,8 +1618,8 @@ class TradeManager:
 
                 hit, reason = self.risk_engine.check_hard_sl(pos, current_price)
                 if hit:
-                    logger.warning("HARD SL TRIGGERED: %s — %s", asset, reason)
-                    self._close_trade(pos, pos.hard_sl, "HARD_SL_1.5%")
+                    logger.warning("HARD SL TRIGGERED: %s — %s (limit %.1f%%)", asset, reason, pos.hard_sl_pct * 100)
+                    self._close_trade(pos, pos.hard_sl, "HARD_SL_HIT")
                     closed = True
                     break
 
@@ -1577,6 +1629,21 @@ class TradeManager:
                 )
                 pos.midline = new_midline
                 pos.peak_r = max(pos.peak_r, current_r)
+                pos.xgb_prob = current_xgb
+
+                # Rule: Stop Loss Prevention — Signal Health (R) Drop by 20% within 10 minutes
+                pos.recent_rs.append(current_r)
+                if len(pos.recent_rs) > 3: # Keep 10 mins (2 bars + current)
+                    pos.recent_rs.pop(0)
+                
+                if len(pos.recent_rs) >= 2:
+                    prev_r = pos.recent_rs[-2]
+                    if current_r < 0.8 * prev_r:
+                        logger.warning("SIGNAL HEALTH DROP: %s — current R %.4f < 80%% of prev R %.4f", 
+                                       asset, current_r, prev_r)
+                        self._close_trade(pos, bar_close, "SIGNAL_HEALTH_DROP")
+                        closed = True
+                        break
 
                 # 3. P-Floor exit check: current XGB score vs exit_p threshold
                 p_exit, p_reason = self.risk_engine.check_p_floor_exit(pos, current_xgb)

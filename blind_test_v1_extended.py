@@ -78,7 +78,7 @@ STRESS_COST = 0.5    # 0.5% (for cooldown logic)
 COOLDOWN_STEPS = [15, 45, 180] # minutes
 
 # Re-define necessary dataclasses for V1 logic
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class ActivePositionV1:
@@ -99,6 +99,8 @@ class ActivePositionV1:
     leverage: int
     group: str
     peak_r: float = 0.0
+    recent_rs: list[float] = field(default_factory=list)
+    hard_sl_pct: float = 0.015
 
 @dataclass
 class TradeRecordV1:
@@ -215,14 +217,26 @@ class BlindTestV1Engine(BacktestEngine):
                 abs_r = abs(r)
                 if abs_r > pos.peak_r:
                     pos.peak_r = abs_r
+                
+                # Update health tracking
+                pos.recent_rs.append(abs_r)
+                if len(pos.recent_rs) > 3:
+                    pos.recent_rs.pop(0)
 
-                # 1. Hard SL (1.5%)
+                # 1. Hard SL (dynamic pct)
                 hit_sl, _ = self._check_hard_sl(pos, price)
                 if hit_sl:
                     to_close.append((pos, price, current_ns, "HARD_SL_HIT"))
                     continue
 
-                # 2. P-Floor
+                # 2. Signal Health Drop (20% drop within 10 mins)
+                if len(pos.recent_rs) >= 2:
+                    prev_r = pos.recent_rs[-2]
+                    if abs_r < 0.8 * prev_r:
+                        to_close.append((pos, price, current_ns, "SIGNAL_HEALTH_DROP"))
+                        continue
+
+                # 3. P-Floor
                 current_xgb = predict_probability(
                     self.xgb_model,
                     confidence=abs_r,
@@ -230,6 +244,7 @@ class BlindTestV1Engine(BacktestEngine):
                     best_tf=pos.best_tf,
                     best_period=pos.best_period,
                 )
+                pos.xgb_prob = current_xgb
                 
                 exit_threshold = self.percentile_calc.get_exit_threshold(get_group(asset), pos.best_tf)
                 if current_xgb < exit_threshold:
@@ -244,11 +259,12 @@ class BlindTestV1Engine(BacktestEngine):
             self._close_position_v1(pos, price, ts_ns, reason)
 
     def _check_hard_sl(self, pos, current_price):
+        sl_pct = pos.hard_sl_pct
         if pos.direction == 1:
             pnl_pct = (current_price - pos.entry_price) / pos.entry_price
         else:
             pnl_pct = (pos.entry_price - current_price) / pos.entry_price
-        if pnl_pct <= -HARD_SL_PCT:
+        if pnl_pct <= -sl_pct:
             return True, f"HARD_SL: {pnl_pct*100:.2f}%"
         return False, ""
 
@@ -296,6 +312,13 @@ class BlindTestV1Engine(BacktestEngine):
             entry_threshold = self.percentile_calc.get_entry_threshold(get_group(asset), best.timeframe)
             if xgb_prob < entry_threshold: continue
 
+            # Rule: LONG Confirmation — both XGB and Pearson R must be above P80
+            if direction == 1:
+                p80_xgb = self.percentile_calc.get_threshold(best.timeframe, 0.80)
+                p80_r = self.percentile_calc.get_r_threshold(best.timeframe, 0.80)
+                if xgb_prob < p80_xgb or abs_r < p80_r:
+                    continue
+
             ad_tf = asset_data[best.timeframe]
             entry_idx = find_bar_index(ad_tf.timestamps, current_ns) + 1
             if entry_idx >= len(ad_tf.timestamps): continue
@@ -306,6 +329,11 @@ class BlindTestV1Engine(BacktestEngine):
             lev = m_params["leverage"]
             vol_scalar = 0.75 if asset in HIGH_VOL_ASSETS else 1.0
             pos_usd = self.capital * gt.pos_frac * lev * vol_scalar
+
+            # Hard SL: 1.5% default, 1.8% for Group A 4h
+            sl_pct = 0.015
+            if get_group(asset) == "A" and best.timeframe == "4h":
+                sl_pct = 0.018
 
             self._trade_counter += 1
             self.positions_v1[asset] = ActivePositionV1(
@@ -326,6 +354,8 @@ class BlindTestV1Engine(BacktestEngine):
                 xgb_prob=xgb_prob,
                 group=get_group(asset),
                 peak_r=abs_r,
+                recent_rs=[abs_r],
+                hard_sl_pct=sl_pct,
             )
 
     def _close_position_v1(self, pos, exit_price, exit_ts_ns, reason):

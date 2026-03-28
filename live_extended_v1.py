@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-live_extended_v1.py — Varanus Neo-Flow Extended: Pure XGB-Percentile Execution Engine.
+live_extended_v1.py — Varanus Neo-Flow Extended: Selective Tier System Engine.
 
-Entry decisions are made SOLELY by XGBoost percentile rank against historical distributions.
-No physics gates (RSI, EMA, PVT, Pearson R, HTF bias, combined gate) are used for entry.
+XGB-Percentile base with 4 High-Alpha layers for maximum profit / minimum SL bleeding.
 
 TF Hierarchy:
-  5m:   1x leverage | XGB >= P90   — Ultra-selective, noise elimination
-  30m:  3x leverage | XGB >= P90   — Balanced risk, trend following
-  1h:   5x leverage | XGB >= P80   — High confidence, trend riding
-  4h:   5x leverage | XGB >= P80   — Macro moves, maximum patience
+  5m:   1x leverage | XGB >= P90
+  30m:  3x leverage | XGB >= P90
+  1h:   5x leverage | XGB >= P80 (Group A: P90)
+  4h:   5x leverage | XGB >= P80 (Group A: P90)
+
+High-Alpha Layers:
+  Layer 1: Signal Health Drop — exit if percentile drops >15pts from entry
+  Layer 2: Majors VIP — Group A (BTC, ETH, BNB...) forces P90 across ALL TFs
+  Layer 3: Dual-Gate LONG — LONG trades require both XGB AND Pearson R above P-threshold
+  Layer 4: P-Floor Stabilization — never 0.000, defaults to P20 safety floor
 
 Hard Constraints:
   - Maximum 8 open positions
@@ -18,16 +23,10 @@ Hard Constraints:
   - XGB data missing/NA → do NOT enter
   - Percentiles clamped at P100
 
-Core logic:
-  1. Entry gate:  XGB score >= entry_p percentile (ONLY gate)
-  2. Exit gate:   XGB score < exit_p percentile → MARKET close (Mathematical Exhaustion)
-  3. Leverage:    Strictly TF-based (1x/3x/5x)
-  4. Hard SL:     Global 1.5% per position
-
 Classes:
   PercentileCalculator — Maps P-values to actual numerical thresholds from trade history
-  SignalAuditor        — Pure XGB-Percentile entry gate
-  RiskEngine           — P-Floor exits, 1.5% hard SL, circuit breaker
+  SignalAuditor        — XGB-Percentile + LONG Dual-Gate entry validation
+  RiskEngine           — P-Floor exits, Signal Health Drop, 1.5% hard SL, circuit breaker
   TradeManager         — Orchestrates scan → entry → 5min audit → exit lifecycle
 
 Usage:
@@ -169,16 +168,19 @@ HARD_SL_PCT = 0.015
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# THE BRAIN: Pure XGB-Percentile Model
+# THE BRAIN: Selective Tier System (XGB-Percentile + High-Alpha Layers)
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Entry is decided SOLELY by XGBoost percentile rank.
-# No physics gates, no Pearson R gates, no PVT, no HTF bias, no combined gate.
+# Base entry gate: XGBoost percentile rank.
+# Layer 1: Signal Health Drop — exit if percentile drops >15pts from entry
+# Layer 2: Majors VIP — Group A forces P90 across ALL TFs
+# Layer 3: Dual-Gate LONG — LONG trades require both XGB AND Pearson R above P-threshold
+# Layer 4: P-Floor Stabilization — never 0.000, defaults to P20
 #
 #   5m:  1x leverage | XGB >= P90
 #   30m: 3x leverage | XGB >= P90
-#   1h:  5x leverage | XGB >= P80
-#   4h:  5x leverage | XGB >= P80
+#   1h:  5x leverage | XGB >= P80 (Group A: P90)
+#   4h:  5x leverage | XGB >= P80 (Group A: P90)
 
 TF_MATRIX = {
     "5m":  {"entry_p": 0.90, "exit_p": 0.20, "leverage": 1},
@@ -189,11 +191,15 @@ TF_MATRIX = {
 
 
 def _get_matrix_params(group: str, tf: str) -> dict:
-    """Lookup TF_MATRIX for a timeframe. Pure percentile — no group overrides."""
+    """Lookup TF_MATRIX for a timeframe. Group A (Majors) forces P90 on ALL TFs."""
     params = TF_MATRIX.get(tf)
     if params is None:
         params = {"entry_p": 0.80, "exit_p": 0.15, "leverage": 5}
-    return dict(params)
+    params = dict(params)  # copy to avoid mutating TF_MATRIX
+    # Layer 2: Majors VIP — Group A forces P90 across ALL timeframes
+    if group == "A":
+        params["entry_p"] = 0.90
+    return params
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -662,6 +668,7 @@ class LivePosition:
     p_entry_threshold: float = 0.0
     p_exit_threshold: float = 0.0
     matrix_leverage: int = 0
+    entry_percentile: float = 0.0  # percentile at entry (for Signal Health Drop)
 
 
 @dataclass
@@ -706,8 +713,9 @@ def load_state() -> LiveState:
             state.total_scans = data.get("total_scans", 0)
             state.current_scanning_asset = data.get("current_scanning_asset", "")
             for asset, pos_data in data.get("positions", {}).items():
-                # Handle legacy state files missing new P-Matrix fields
-                for fld in ("p_entry_threshold", "p_exit_threshold", "matrix_leverage"):
+                # Handle legacy state files missing new fields
+                for fld in ("p_entry_threshold", "p_exit_threshold", "matrix_leverage",
+                            "entry_percentile"):
                     pos_data.setdefault(fld, 0)
                 state.positions[asset] = LivePosition(**pos_data)
         except Exception as e:
@@ -732,6 +740,7 @@ class PercentileCalculator:
     def __init__(self, xgb_model: xgb.XGBClassifier):
         self.xgb_model = xgb_model
         self._distributions: dict[str, np.ndarray] = {}  # key = "5m", "30m", etc.
+        self._r_distributions: dict[str, np.ndarray] = {}  # Pearson R per TF (Layer 3: LONG dual-gate)
         self._build_distributions()
 
     def _find_trade_csvs(self) -> list[Path]:
@@ -814,6 +823,20 @@ class PercentileCalculator:
             else:
                 logger.info("  TF %s: only %d trades (< 10), will use global fallback", tf, len(scores))
 
+        # Build Pearson R distributions per TF (Layer 3: LONG dual-gate)
+        for tf in SCAN_TIMEFRAMES:
+            mask = combined["best_tf"] == tf
+            r_scores = combined.loc[mask, "confidence"].values
+            if len(r_scores) >= 10:
+                self._r_distributions[tf] = np.sort(r_scores)
+                logger.info("  TF %s R-dist: %d trades | P70=%.4f P75=%.4f P80=%.4f P90=%.4f",
+                            tf, len(r_scores),
+                            np.percentile(r_scores, 70), np.percentile(r_scores, 75),
+                            np.percentile(r_scores, 80), np.percentile(r_scores, 90))
+        all_r = combined["confidence"].values
+        if len(all_r) >= 10:
+            self._r_distributions["GLOBAL"] = np.sort(all_r)
+
         # Global fallback (all TFs combined)
         all_scores = combined["xgb_score"].values
         if len(all_scores) >= 10:
@@ -844,6 +867,14 @@ class PercentileCalculator:
                         tf, percentile)
         return percentile
 
+    def get_r_threshold(self, tf: str, percentile: float) -> float:
+        """Get the Pearson R threshold at a given percentile (Layer 3: LONG dual-gate)."""
+        if tf in self._r_distributions:
+            return float(np.percentile(self._r_distributions[tf], percentile * 100))
+        if "GLOBAL" in self._r_distributions:
+            return float(np.percentile(self._r_distributions["GLOBAL"], percentile * 100))
+        return percentile
+
     def score_to_percentile(self, tf: str, score: float) -> float:
         """Convert an XGB score to its percentile rank (0-100) for a given TF. Clamped at P100."""
         dist = self._distributions.get(tf)
@@ -871,10 +902,11 @@ class PercentileCalculator:
 
 class SignalAuditor:
     """
-    Pure XGB-Percentile entry gate.
-    Generates a signal via regression scan, then the ONLY filter is:
-      XGB score >= TF-specific percentile threshold.
-    No physics gates, no Pearson R gate, no PVT, no HTF bias, no combined gate.
+    Selective Tier entry gate:
+      1. XGB score >= TF-specific percentile threshold
+      2. Layer 2: Group A (Majors) forced to P90 across ALL TFs
+      3. Layer 3: LONG trades require both XGB AND Pearson R above P-threshold
+         SHORT trades pass with single-gate XGB only.
     """
 
     def __init__(self, xgb_model: xgb.XGBClassifier, percentile_calc: PercentileCalculator,
@@ -930,7 +962,7 @@ class SignalAuditor:
             _fail["reason"] = "xgb_na"
             return _fail
 
-        # Step 3: P-Matrix gate — the ONLY entry filter
+        # Step 3: P-Matrix XGB gate
         entry_threshold = self.percentile_calc.get_entry_threshold(group, signal_obj.best_tf)
         exit_threshold = self.percentile_calc.get_exit_threshold(group, signal_obj.best_tf)
         matrix_params = _get_matrix_params(group, signal_obj.best_tf)
@@ -951,6 +983,29 @@ class SignalAuditor:
                 "matrix_leverage": matrix_leverage, "near_miss": near_miss,
                 "reason": "p_matrix_rejected",
             }
+
+        # Step 4 — Layer 3: Dual-Gate LONG Confirmation
+        # LONG trades must have BOTH XGB AND Pearson R above P-threshold.
+        # SHORT trades pass with single-gate XGB only.
+        if signal_obj.direction == 1:  # LONG
+            r_threshold = self.percentile_calc.get_r_threshold(
+                signal_obj.best_tf, matrix_params["entry_p"]
+            )
+            if signal_obj.confidence < r_threshold:
+                near_miss = {
+                    "asset": asset, "group": group, "dir": "LONG",
+                    "tf": signal_obj.best_tf, "period": signal_obj.best_period,
+                    "rejected_at": "LONG-R-GATE",
+                    "detail": (f"R={signal_obj.confidence:.4f} < "
+                               f"R_P{matrix_params['entry_p']*100:.0f}={r_threshold:.4f}"),
+                    "xgb_prob": round(xgb_prob, 4),
+                }
+                return {
+                    "passed": False, "signal": signal_obj, "xgb_prob": xgb_prob,
+                    "entry_threshold": entry_threshold, "exit_threshold": exit_threshold,
+                    "matrix_leverage": matrix_leverage, "near_miss": near_miss,
+                    "reason": "long_r_gate_rejected",
+                }
 
         return {
             "passed": True, "signal": signal_obj, "xgb_prob": xgb_prob,
@@ -1029,17 +1084,17 @@ class RiskEngine:
 
     def _zero_floor_fallback(self, pos: LivePosition) -> float:
         """
-        Zero-Floor Protection: re-sync with historical validation data
-        or use P15 floor from last 100 successful trades.
+        Layer 4: P-Floor Stabilization — never 0.000, defaults to P20.
+        Re-sync with historical validation data or use P20 as hard safety floor.
         """
-        # First: re-sync from PercentileCalculator (P15 for the TF)
-        threshold = self.percentile_calc.get_threshold(pos.best_tf, 0.15)
+        # First: re-sync from PercentileCalculator (P20 for the TF)
+        threshold = self.percentile_calc.get_threshold(pos.best_tf, 0.20)
         if threshold > 0.001:
-            logger.warning("ZERO-FLOOR RESYNC: %s/%s → P15=%.4f from distributions",
+            logger.warning("P-FLOOR RESYNC: %s/%s → P20=%.4f from distributions",
                            pos.asset, pos.best_tf, threshold)
             return threshold
 
-        # Second: compute P15 from last 100 successful trades
+        # Second: compute P20 from last 100 successful trades
         try:
             if TRADES_FILE.exists():
                 df = pd.read_csv(TRADES_FILE)
@@ -1061,16 +1116,16 @@ class RiskEngine:
                             except Exception:
                                 pass
                         if len(xgb_scores) >= 5:
-                            p15 = float(np.percentile(xgb_scores, 15))
-                            logger.warning("ZERO-FLOOR FALLBACK: %s → P15=%.4f from %d winning trades",
-                                           pos.asset, p15, len(xgb_scores))
-                            return p15
+                            p20 = float(np.percentile(xgb_scores, 20))
+                            logger.warning("P-FLOOR FALLBACK: %s → P20=%.4f from %d winning trades",
+                                           pos.asset, p20, len(xgb_scores))
+                            return p20
         except Exception as e:
-            logger.error("ZERO-FLOOR fallback computation failed: %s", e)
+            logger.error("P-FLOOR fallback computation failed: %s", e)
 
-        # Ultimate fallback: absolute P15 default
-        logger.warning("ZERO-FLOOR DEFAULT: %s → using absolute fallback P15=0.15", pos.asset)
-        return 0.15
+        # Ultimate fallback: absolute P20 default
+        logger.warning("P-FLOOR DEFAULT: %s → using absolute fallback P20=0.20", pos.asset)
+        return 0.20
 
     def check_hard_sl(self, pos: LivePosition, current_price: float) -> tuple[bool, str]:
         """
@@ -1160,7 +1215,7 @@ class TradeManager:
 
         logger.info("TradeManager initialized — mode=%s, capital=$%.0f, assets=%d",
                      "LIVE" if live_mode else "DRY-RUN", self.state.initial_capital, len(ASSETS))
-        logger.info("Pure XGB-Percentile Engine active. No physics gates, no cooldowns.")
+        logger.info("Selective Tier System active. L1:HealthDrop L2:MajorsVIP L3:LongDualGate L4:PFloorP20")
 
         # Log TF hierarchy thresholds
         for tf in ["5m", "30m", "1h", "4h"]:
@@ -1270,6 +1325,7 @@ class TradeManager:
                 "HARD_SL_1.5%": "\U0001F6A8 HARD SL 1\\.5%",
                 "TIME_BARRIER": "\u23F0 TIME BARRIER",
                 "ADAPTIVE_TRAIL_HIT": "\U0001F4C9 TRAIL STOP",
+                "SIGNAL_HEALTH_DROP": "\U0001F4C9 SIGNAL HEALTH DROP",
             }.get(reason, _e(reason))
             _pnl = f"{net_pnl_pct:+.2f}"
             _usd = f"${pnl_usd:+,.2f}"
@@ -1355,6 +1411,7 @@ class TradeManager:
                 sl_order_id = str(sl_order.get("id", ""))
 
         self.state.trade_counter += 1
+        entry_pctl = self.percentile_calc.score_to_percentile(signal.best_tf, xgb_prob)
         pos = LivePosition(
             trade_id=self.state.trade_counter, asset=asset, group=group,
             symbol=f"{asset}USDT",
@@ -1367,6 +1424,7 @@ class TradeManager:
             p_entry_threshold=entry_threshold,
             p_exit_threshold=exit_threshold,
             matrix_leverage=matrix_leverage,
+            entry_percentile=entry_pctl,
         )
         self.state.positions[asset] = pos
         save_state(self.state)
@@ -1513,6 +1571,17 @@ class TradeManager:
                 )
                 pos.midline = new_midline
                 pos.peak_r = max(pos.peak_r, current_r)
+
+                # 2b. Layer 1: Signal Health Drop — if percentile drops >15pts from entry, exit
+                if pos.entry_percentile > 0:
+                    current_pctl = self.percentile_calc.score_to_percentile(pos.best_tf, current_xgb)
+                    pctl_drop = pos.entry_percentile - current_pctl
+                    if pctl_drop > 15.0:
+                        logger.warning("SIGNAL HEALTH DROP: %s — entry P%.0f → P%.0f (drop=%.1f pts)",
+                                       asset, pos.entry_percentile, current_pctl, pctl_drop)
+                        self._close_trade(pos, bar_close, "SIGNAL_HEALTH_DROP")
+                        closed = True
+                        break
 
                 # 3. P-Floor exit check: current XGB score vs exit_p threshold
                 p_exit, p_reason = self.risk_engine.check_p_floor_exit(pos, current_xgb)
@@ -1694,29 +1763,49 @@ class TradeManager:
                     f"  Status: {status}"
                 )
 
-        # ── 4. REJECTED NOISE (below entry barrier) ──
+        # ── 4. REJECTED NOISE ──
         if near_misses:
+            # Group by rejection type
+            p_matrix_nms = [nm for nm in near_misses if nm.get("rejected_at") == "P-MATRIX"]
+            long_r_nms = [nm for nm in near_misses if nm.get("rejected_at") == "LONG-R-GATE"]
+
             lines.append(f"\n\U0001F6AB *REJECTED NOISE \\({e(len(near_misses))}\\)*")
-            lines.append(
-                "\U0001F4CA *BELOW ENTRY BARRIER \\(P\\-Matrix\\)*\n"
-                "  _XGB score below TF\\-specific percentile threshold\\._"
-            )
-            for nm in near_misses:
-                _xgb_nm = f"{nm.get('xgb_prob', 0):.4f}"
+
+            if p_matrix_nms:
                 lines.append(
-                    f"  {e(nm['asset'])}\\[{e(nm.get('group', '?'))}\\] "
-                    f"{e(nm['dir'])} \\| XGB: {e(_xgb_nm)} \\| {e(nm.get('detail', ''))}"
+                    "\n\U0001F4CA *BELOW ENTRY BARRIER \\(P\\-Matrix\\)*\n"
+                    "  _XGB score below TF percentile threshold\\._"
                 )
+                for nm in p_matrix_nms:
+                    _xgb_nm = f"{nm.get('xgb_prob', 0):.4f}"
+                    lines.append(
+                        f"  {e(nm['asset'])}\\[{e(nm.get('group', '?'))}\\] "
+                        f"{e(nm['dir'])} \\| XGB: {e(_xgb_nm)} \\| {e(nm.get('detail', ''))}"
+                    )
+
+            if long_r_nms:
+                lines.append(
+                    "\n\U0001F512 *LONG R\\-GATE BLOCKED*\n"
+                    "  _LONG signal passed XGB but Pearson R below threshold\\. Dual\\-gate blocked\\._"
+                )
+                for nm in long_r_nms:
+                    _xgb_nm = f"{nm.get('xgb_prob', 0):.4f}"
+                    lines.append(
+                        f"  {e(nm['asset'])}\\[{e(nm.get('group', '?'))}\\] "
+                        f"LONG \\| XGB: {e(_xgb_nm)} \\| {e(nm.get('detail', ''))}"
+                    )
 
             # ── 5. ALPHA OPPORTUNITY (closest to entry) ──
             best_nm = max(near_misses, key=lambda nm: nm.get("xgb_prob", 0))
             best_xgb = best_nm.get("xgb_prob", 0)
             _best_xgb_s = f"{best_xgb:.4f}"
+            watch = "Pearson R to exceed P\\-threshold" if best_nm.get("rejected_at") == "LONG-R-GATE" \
+                else "XGB score to climb above entry barrier"
             lines.append(
                 f"\n\U0001F48E *TOP SPEC:* {e(best_nm['asset'])} "
                 f"\\[{e(best_nm.get('group', '?'))}\\] {e(best_nm['dir'])} "
                 f"\\| XGB: {e(_best_xgb_s)}\n"
-                f"  _Watch for: XGB score to climb above entry barrier_"
+                f"  _Watch for: {watch}_"
             )
 
         tg_send("\n".join(lines), parse_mode="MarkdownV2")
@@ -1838,7 +1927,7 @@ class TradeManager:
             f"{pnl_emoji} *PnL:* {e(f'${rpnl:+,.2f}')}",
             f"*Drawdown:* {e(f'{dd:.2f}')}% \\| *Peak:* {e(f'${peak:,.2f}')}",
             f"\U0001F916 *BOT STATUS:* {e(n_open)} Positions Open / {e(MAX_CONCURRENT)} Max",
-            f"*Scans:* {e(scans)} \\| *Entry:* P90/P90/P80/P80",
+            f"*Scans:* {e(scans)} \\| *Entry:* P90/P90/P80/P80 \\(GrpA\\=P90\\)",
         ]
 
         # ── 2. ACTIVE BATTLES ──
@@ -2149,12 +2238,13 @@ def main():
     _e = _mdv2
     _mode = "LIVE" if args.live else "DRY\\-RUN"
     tg_send(
-        f"\U0001F680 *v1 Pure XGB\\-Percentile Engine Started*\n"
+        f"\U0001F680 *v1 Selective Tier System Started*\n"
         f"*Mode:* {_mode} \\| *Capital:* {_e(f'${args.capital:,.0f}')}\n"
         f"*Assets:* {_e(len(ASSETS))} \\| *Leverage:* 5m\\=1x 30m\\=3x 1h/4h\\=5x\n"
-        f"*Entry:* 5m/30m\\=P90 \\| 1h/4h\\=P80 \\(XGB only\\)\n"
-        f"*Exit:* P20/P20/P15/P15 \\+ 1\\.5% Hard SL\n"
-        f"*No cooldowns* \\| *Max 8 positions*\n"
+        f"*Entry:* 5m/30m\\=P90 \\| 1h/4h\\=P80 \\(GrpA\\=P90 all\\)\n"
+        f"*L1:* Signal Health Drop \\(\\>15pt exit\\)\n"
+        f"*L3:* LONG Dual\\-Gate \\(XGB\\+R\\) \\| *L4:* P\\-Floor\\=P20\n"
+        f"*Max 8 positions* \\| *Hard SL:* 1\\.5%\n"
         f"*Next scan:* {_e(next_trigger.strftime('%H:%M UTC'))} \\({_e(wait_secs // 60)}m\\)",
         parse_mode="MarkdownV2",
     )

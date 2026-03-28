@@ -899,7 +899,9 @@ class PercentileCalculator:
 
     def score_to_percentile(self, tf: str, score: float) -> float:
         """Convert an XGB score to its percentile rank (0-100) for a given TF."""
-        dist = self._distributions.get(tf) or self._distributions.get("GLOBAL")
+        dist = self._distributions.get(tf)
+        if dist is None:
+            dist = self._distributions.get("GLOBAL")
         if dist is None or len(dist) == 0:
             return score * 100
         idx = np.searchsorted(dist, score)
@@ -2377,43 +2379,47 @@ def start_telegram_listener(bot: TradeManager):
                     msg = update.get("message", {})
                     if str(msg.get("chat", {}).get("id")) == TELEGRAM_CHAT_ID:
                         text = msg.get("text", "").lower()
-                        if "/status" in text:
-                            bot.send_status()
-                        elif "/daily" in text:
-                            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                            bot.send_daily_snapshot(target_date=today)
-                        elif text.startswith("/reset"):
-                            # Manual cooldown/blacklist reset: /reset ASSET
-                            parts = msg.get("text", "").split()
-                            if len(parts) >= 2:
-                                asset_arg = parts[1].upper().replace("USDT", "")
-                                with bot.lock:
-                                    if bot.cooldown_mgr.reset_cooldown(asset_arg):
-                                        save_state(bot.state)
-                                        tg_send(
-                                            f"\u2705 *MANUAL RESET*\n"
-                                            f"{_mdv2(asset_arg)}: cooldown and blacklist cleared\\.",
-                                            parse_mode="MarkdownV2",
-                                        )
-                                    else:
-                                        tg_send(
-                                            f"\u26A0\uFE0F {_mdv2(asset_arg)} has no active cooldown\\.",
-                                            parse_mode="MarkdownV2",
-                                        )
-                            else:
+                        try:
+                            if "/status" in text:
+                                bot.send_status()
+                            elif "/daily" in text:
+                                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                                bot.send_daily_snapshot(target_date=today)
+                            elif text.startswith("/reset"):
+                                # Manual cooldown/blacklist reset: /reset ASSET
+                                parts = msg.get("text", "").split()
+                                if len(parts) >= 2:
+                                    asset_arg = parts[1].upper().replace("USDT", "")
+                                    with bot.lock:
+                                        if bot.cooldown_mgr.reset_cooldown(asset_arg):
+                                            save_state(bot.state)
+                                            tg_send(
+                                                f"\u2705 *MANUAL RESET*\n"
+                                                f"{_mdv2(asset_arg)}: cooldown and blacklist cleared\\.",
+                                                parse_mode="MarkdownV2",
+                                            )
+                                        else:
+                                            tg_send(
+                                                f"\u26A0\uFE0F {_mdv2(asset_arg)} has no active cooldown\\.",
+                                                parse_mode="MarkdownV2",
+                                            )
+                                else:
+                                    tg_send(
+                                        "\u26A0\uFE0F Usage: `/reset ASSET` \\(e\\.g\\. `/reset BTC`\\)",
+                                        parse_mode="MarkdownV2",
+                                    )
+                            elif "/help" in text:
                                 tg_send(
-                                    "\u26A0\uFE0F Usage: `/reset ASSET` \\(e\\.g\\. `/reset BTC`\\)",
+                                    "\u2139\uFE0F *Commands:*\n"
+                                    "/status \\- Bot status with P\\-Matrix info\n"
+                                    "/daily \\- Today's performance snapshot\n"
+                                    "/reset ASSET \\- Manual cooldown/blacklist reset\n"
+                                    "/help \\- Show this help",
                                     parse_mode="MarkdownV2",
                                 )
-                        elif "/help" in text:
-                            tg_send(
-                                "\u2139\uFE0F *Commands:*\n"
-                                "/status \\- Bot status with P\\-Matrix info\n"
-                                "/daily \\- Today's performance snapshot\n"
-                                "/reset ASSET \\- Manual cooldown/blacklist reset\n"
-                                "/help \\- Show this help",
-                                parse_mode="MarkdownV2",
-                            )
+                        except Exception as cmd_err:
+                            logger.exception("Telegram command error (%s): %s", text, cmd_err)
+                            tg_send(f"Command error: {cmd_err}")
             except Exception as e:
                 logger.error("Telegram listener error: %s", e)
                 time.sleep(5)

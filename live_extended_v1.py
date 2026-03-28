@@ -2,7 +2,7 @@
 """
 live_extended_v1.py — Varanus Neo-Flow Extended: Selective Tier System Engine.
 
-XGB-Percentile base with 4 High-Alpha layers for maximum profit / minimum SL bleeding.
+XGB-Percentile entry with Adaptive Trailing Stop exits for profit-riding.
 
 TF Hierarchy:
   5m:   1x leverage | XGB >= P90
@@ -10,15 +10,22 @@ TF Hierarchy:
   1h:   5x leverage | XGB >= P80 (Group A: P90)
   4h:   5x leverage | XGB >= P80 (Group A: P90)
 
-High-Alpha Layers:
-  Layer 1: Signal Health Drop — exit if percentile drops >15pts from entry
+Entry Layers:
   Layer 2: Majors VIP — Group A (BTC, ETH, BNB...) forces P90 across ALL TFs
   Layer 3: Dual-Gate LONG — LONG trades require both XGB AND Pearson R above P-threshold
-  Layer 4: P-Floor Stabilization — never 0.000, defaults to P20 safety floor
+
+Exit Logic (priority order):
+  1. Hard SL 1.5% — emergency stop, never overridden
+  2. Adaptive Trailing Stop — ratcheting midline-based trail, lets winners run
+  3. P-Floor Exhaustion — XGB score drops below exit_p threshold
+  4. Time Barrier — max 200 bars held
+
+Layer 4: P-Floor Stabilization — never 0.000, defaults to P20 safety floor
 
 Hard Constraints:
   - Maximum 8 open positions
   - Hard Stop Loss: Fixed 1.5% for all entries
+  - Trail only activates after 3 bars (commission protection)
   - No cooldowns between trades
   - XGB data missing/NA → do NOT enter
   - Percentiles clamped at P100
@@ -26,7 +33,7 @@ Hard Constraints:
 Classes:
   PercentileCalculator — Maps P-values to actual numerical thresholds from trade history
   SignalAuditor        — XGB-Percentile + LONG Dual-Gate entry validation
-  RiskEngine           — P-Floor exits, Signal Health Drop, 1.5% hard SL, circuit breaker
+  RiskEngine           — Adaptive Trail, P-Floor exits, 1.5% hard SL, circuit breaker
   TradeManager         — Orchestrates scan → entry → 5min audit → exit lifecycle
 
 Usage:
@@ -160,6 +167,11 @@ _exec = CONFIG.get("execution", {})
 STOP_LIMIT_BUFFER = _exec.get("stop_limit_buffer_pct", 0.05) / 100.0
 LIMIT_BUFFER = _exec.get("limit_buffer_pct", 0.05) / 100.0
 
+# Trail protection: don't activate trail until N bars have passed (commission protection)
+_trail_cfg = CONFIG.get("trail_protection", {})
+MIN_TRAIL_PCT = _trail_cfg.get("min_trail_pct", 0.15) / 100.0  # 0.0015 = 0.15%
+MIN_BARS_BEFORE_TRAIL = _trail_cfg.get("min_bars_before_trail", 3)
+
 # P-Floor monitor interval (seconds) — check every 5 minutes
 PFLOOR_MONITOR_INTERVAL = 300
 
@@ -168,14 +180,16 @@ HARD_SL_PCT = 0.015
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# THE BRAIN: Selective Tier System (XGB-Percentile + High-Alpha Layers)
+# THE BRAIN: Selective Tier System (XGB Entry + Adaptive Trail Exit)
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Base entry gate: XGBoost percentile rank.
-# Layer 1: Signal Health Drop — exit if percentile drops >15pts from entry
-# Layer 2: Majors VIP — Group A forces P90 across ALL TFs
-# Layer 3: Dual-Gate LONG — LONG trades require both XGB AND Pearson R above P-threshold
-# Layer 4: P-Floor Stabilization — never 0.000, defaults to P20
+# ENTRY: XGBoost percentile rank gate.
+#   Layer 2: Majors VIP — Group A forces P90 across ALL TFs
+#   Layer 3: Dual-Gate LONG — LONG trades require both XGB AND Pearson R above P-threshold
+#
+# EXIT: Adaptive Trailing Stop (profit-riding) + P-Floor + Hard SL
+#   Trail ratchets with regression midline, only activates after 3 bars.
+#   Layer 4: P-Floor Stabilization — never 0.000, defaults to P20
 #
 #   5m:  1x leverage | XGB >= P90
 #   30m: 3x leverage | XGB >= P90
@@ -668,7 +682,7 @@ class LivePosition:
     p_entry_threshold: float = 0.0
     p_exit_threshold: float = 0.0
     matrix_leverage: int = 0
-    entry_percentile: float = 0.0  # percentile at entry (for Signal Health Drop)
+    entry_percentile: float = 0.0  # percentile at entry (informational)
 
 
 @dataclass
@@ -1021,13 +1035,13 @@ class SignalAuditor:
 
 class RiskEngine:
     """
-    Manages all exit logic via Mathematical Exhaustion:
-      1. P-Floor exit: current XGB score < exit_p threshold → immediate MARKET close
-         (Mathematical Exhaustion — overrides trailing stops)
-      2. Hard SL: 1.5% adverse move from entry → MARKET close (overrides P-Floor)
-      3. Circuit breaker: portfolio drawdown exceeds MAX_DRAWDOWN_PCT
+    Manages all exit logic:
+      1. Hard SL: 1.5% adverse move from entry → MARKET close (highest priority)
+      2. Adaptive Trailing Stop: ratcheting midline-based trail, lets winners run
+      3. P-Floor exit: current XGB score < exit_p threshold → MARKET close
+      4. Circuit breaker: portfolio drawdown exceeds MAX_DRAWDOWN_PCT
 
-    Priority: Hard SL > P-Floor > Time Barrier
+    Priority: Hard SL > Adaptive Trail > P-Floor > Time Barrier
     """
 
     def __init__(self, xgb_model: xgb.XGBClassifier, percentile_calc: PercentileCalculator):
@@ -1127,6 +1141,30 @@ class RiskEngine:
         logger.warning("P-FLOOR DEFAULT: %s → using absolute fallback P20=0.20", pos.asset)
         return 0.20
 
+    def update_trail(self, pos: LivePosition, new_midline: float, new_std_dev: float,
+                     trail_buffer: float) -> None:
+        """
+        Update the adaptive trailing stop using the regression midline.
+        Ratchets only (LONG: trail only moves up, SHORT: trail only moves down).
+        Only activates after MIN_BARS_BEFORE_TRAIL bars to protect against commission losses.
+        """
+        if pos.bars_held < MIN_BARS_BEFORE_TRAIL:
+            return  # Don't tighten trail in the first N bars
+        pos.trail_sl = compute_trail_sl(
+            pos.direction, new_midline, new_std_dev, pos.trail_sl, trail_buffer,
+        )
+
+    def check_trail_hit(self, pos: LivePosition, bar_high: float, bar_low: float) -> tuple[bool, str]:
+        """
+        Check if the adaptive trailing stop was hit during this bar.
+        Returns (should_exit, reason).
+        """
+        if pos.direction == 1 and bar_low <= pos.trail_sl:
+            return True, f"ADAPTIVE_TRAIL_HIT: low={bar_low:.6f} <= trail={pos.trail_sl:.6f}"
+        if pos.direction == -1 and bar_high >= pos.trail_sl:
+            return True, f"ADAPTIVE_TRAIL_HIT: high={bar_high:.6f} >= trail={pos.trail_sl:.6f}"
+        return False, ""
+
     def check_hard_sl(self, pos: LivePosition, current_price: float) -> tuple[bool, str]:
         """
         Global 1.5% hard SL check — emergency circuit breaker per position.
@@ -1215,7 +1253,7 @@ class TradeManager:
 
         logger.info("TradeManager initialized — mode=%s, capital=$%.0f, assets=%d",
                      "LIVE" if live_mode else "DRY-RUN", self.state.initial_capital, len(ASSETS))
-        logger.info("Selective Tier System active. L1:HealthDrop L2:MajorsVIP L3:LongDualGate L4:PFloorP20")
+        logger.info("Selective Tier System active. Exit:AdaptiveTrail+PFloor | L2:MajorsVIP L3:LongDualGate L4:PFloorP20")
 
         # Log TF hierarchy thresholds
         for tf in ["5m", "30m", "1h", "4h"]:
@@ -1325,7 +1363,8 @@ class TradeManager:
                 "HARD_SL_1.5%": "\U0001F6A8 HARD SL 1\\.5%",
                 "TIME_BARRIER": "\u23F0 TIME BARRIER",
                 "ADAPTIVE_TRAIL_HIT": "\U0001F4C9 TRAIL STOP",
-                "SIGNAL_HEALTH_DROP": "\U0001F4C9 SIGNAL HEALTH DROP",
+                "P_FLOOR_EXIT": "\U0001F4C9 P\\-FLOOR EXIT",
+                "P_FLOOR_EXIT_4H_PROJ": "\U0001F4C9 P\\-FLOOR 4H PROJ",
             }.get(reason, _e(reason))
             _pnl = f"{net_pnl_pct:+.2f}"
             _usd = f"${pnl_usd:+,.2f}"
@@ -1454,7 +1493,7 @@ class TradeManager:
         )
         return entry
 
-    # ── Position Monitoring (P-Floor + Hard SL) ───────────────────────────
+    # ── Position Monitoring (Hard SL + Adaptive Trail + P-Floor) ───────────
 
     def _refresh_position_data(self):
         """Fetch latest bars from Binance for open positions' TFs."""
@@ -1488,10 +1527,10 @@ class TradeManager:
         Continuous Signal Audit — runs every 5 minutes (on each WS bar close).
         For each open trade:
           1. Hard SL check: 1.5% adverse → MARKET close (highest priority)
-          2. Recompute Pearson R + XGB score on original entry_tf with latest data
-          3. Mathematical Exhaustion: if current_score < exit_p_floor → MARKET close
-             (overrides any trailing stop)
-          4. Time barrier: safety net at MAX_BARS_HELD
+          2. Recompute regression + XGB, update adaptive trailing stop
+          3. Check if trailing stop was hit → exit at trail price
+          4. P-Floor Exhaustion: if current XGB < exit_p_floor → MARKET close
+          5. Time barrier: safety net at MAX_BARS_HELD
         """
         global _cached_data
         if _cached_data is None:
@@ -1569,19 +1608,25 @@ class TradeManager:
                 current_r, current_xgb, new_midline = self.risk_engine.compute_current_score(
                     pos, close_arr
                 )
+                new_std_dev = pos.std_dev  # preserve std_dev from entry
+                if len(close_arr) >= pos.best_period:
+                    new_std_dev, _, _, _ = calc_log_regression(close_arr, pos.best_period)
                 pos.midline = new_midline
+                pos.std_dev = new_std_dev
                 pos.peak_r = max(pos.peak_r, current_r)
 
-                # 2b. Layer 1: Signal Health Drop — if percentile drops >15pts from entry, exit
-                if pos.entry_percentile > 0:
-                    current_pctl = self.percentile_calc.score_to_percentile(pos.best_tf, current_xgb)
-                    pctl_drop = pos.entry_percentile - current_pctl
-                    if pctl_drop > 15.0:
-                        logger.warning("SIGNAL HEALTH DROP: %s — entry P%.0f → P%.0f (drop=%.1f pts)",
-                                       asset, pos.entry_percentile, current_pctl, pctl_drop)
-                        self._close_trade(pos, bar_close, "SIGNAL_HEALTH_DROP")
-                        closed = True
-                        break
+                # 2b. Adaptive Trailing Stop — update trail then check hit
+                gt = self.group_thresholds.get(pos.group)
+                trail_buffer = gt.trail_buffer if gt else self.consensus["trail_buffer"]
+                self.risk_engine.update_trail(pos, new_midline, new_std_dev, trail_buffer)
+
+                trail_hit, trail_reason = self.risk_engine.check_trail_hit(pos, bar_high, bar_low)
+                if trail_hit:
+                    logger.warning("ADAPTIVE TRAIL HIT: %s — %s", asset, trail_reason)
+                    exit_price = pos.trail_sl  # exit at trail level
+                    self._close_trade(pos, exit_price, "ADAPTIVE_TRAIL_HIT")
+                    closed = True
+                    break
 
                 # 3. P-Floor exit check: current XGB score vs exit_p threshold
                 p_exit, p_reason = self.risk_engine.check_p_floor_exit(pos, current_xgb)
@@ -2238,13 +2283,13 @@ def main():
     _e = _mdv2
     _mode = "LIVE" if args.live else "DRY\\-RUN"
     tg_send(
-        f"\U0001F680 *v1 Selective Tier System Started*\n"
+        f"\U0001F680 *v1 Selective Tier \\+ Adaptive Trail*\n"
         f"*Mode:* {_mode} \\| *Capital:* {_e(f'${args.capital:,.0f}')}\n"
         f"*Assets:* {_e(len(ASSETS))} \\| *Leverage:* 5m\\=1x 30m\\=3x 1h/4h\\=5x\n"
         f"*Entry:* 5m/30m\\=P90 \\| 1h/4h\\=P80 \\(GrpA\\=P90 all\\)\n"
-        f"*L1:* Signal Health Drop \\(\\>15pt exit\\)\n"
+        f"*Exit:* Adaptive Trail \\+ P\\-Floor \\+ 1\\.5% Hard SL\n"
         f"*L3:* LONG Dual\\-Gate \\(XGB\\+R\\) \\| *L4:* P\\-Floor\\=P20\n"
-        f"*Max 8 positions* \\| *Hard SL:* 1\\.5%\n"
+        f"*Max 8 positions* \\| *Trail after {_e(MIN_BARS_BEFORE_TRAIL)} bars*\n"
         f"*Next scan:* {_e(next_trigger.strftime('%H:%M UTC'))} \\({_e(wait_secs // 60)}m\\)",
         parse_mode="MarkdownV2",
     )

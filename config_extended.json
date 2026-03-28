@@ -61,17 +61,19 @@
   },
 
   "escalating_cooldown": {
-    "description": "Anti-churn logic: escalating per-asset cooldowns on consecutive losses",
+    "description": "Anti-churn logic: escalating per-asset cooldowns on consecutive losses. 3rd loss triggers 24h blacklist (auto-reset or manual /reset).",
     "profit_reset_pct": 0.5,
     "default_steps": {
       "1st_loss_minutes": 15,
       "2nd_loss_minutes": 45,
-      "3rd_loss_minutes": 180
+      "3rd_loss_minutes": 180,
+      "blacklist_hours": 24
     },
     "group_c_steps": {
       "1st_loss_minutes": 5,
       "2nd_loss_minutes": 15,
-      "3rd_loss_minutes": 180
+      "3rd_loss_minutes": 180,
+      "blacklist_hours": 24
     }
   },
 

@@ -187,9 +187,9 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════════════════════════
 
 TF_MATRIX = {
-    "5m":  {"entry_p": 0.80, "exit_p": 0.30, "leverage": 1},
-    "30m": {"entry_p": 0.75, "exit_p": 0.20, "leverage": 3},
-    "1h":  {"entry_p": 0.70, "exit_p": 0.15, "leverage": 5},
+    "5m":  {"entry_p": 0.90, "exit_p": 0.20, "leverage": 1},
+    "30m": {"entry_p": 0.80, "exit_p": 0.20, "leverage": 3},
+    "1h":  {"entry_p": 0.75, "exit_p": 0.15, "leverage": 5},
     "4h":  {"entry_p": 0.70, "exit_p": 0.15, "leverage": 5},
 }
 
@@ -450,6 +450,33 @@ def _fetch_live_candles(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         return df[["open", "high", "low", "close", "volume"]]
     except Exception:
         return pd.DataFrame()
+
+@st.cache_data(ttl=10)
+def _fetch_5m_probe(symbol: str) -> pd.DataFrame:
+    """Fetch latest 5m candles with short TTL for sub-candle live auditing."""
+    try:
+        resp = requests.get(
+            BINANCE_KLINES_URL,
+            params={"symbol": symbol, "interval": "5m", "limit": 6},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        if not raw:
+            return pd.DataFrame()
+        df = pd.DataFrame(raw, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades", "taker_buy_base",
+            "taker_buy_quote", "ignore",
+        ])
+        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
+        df = df.set_index("timestamp").sort_index()
+        return df[["open", "high", "low", "close", "volume"]]
+    except Exception:
+        return pd.DataFrame()
+
 
 @st.cache_data(ttl=30)
 def run_dashboard_scan() -> list[dict]:
@@ -1295,14 +1322,42 @@ def render_charting(state: dict, trades_df: pd.DataFrame):
     exit_threshold = _get_pmatrix_threshold(distributions, selected_tf, tf_matrix["exit_p"])
     p50_threshold = _get_pmatrix_threshold(distributions, selected_tf, 0.50)
 
+    # ── Sub-candle auditing: 5m probe for HTF live signal ──
+    # For 30m/1h/4h charts, fetch fresh 5m data to project the live XGB
+    needs_live_probe = selected_tf in ("30m", "1h", "4h")
+    live_5m_close = None
+    live_5m_ts = None
+    if needs_live_probe:
+        df_5m = _fetch_5m_probe(symbol)
+        if not df_5m.empty:
+            live_5m_close = float(df_5m["close"].iloc[-1])
+            live_5m_ts = df_5m.index[-1]
+
+    # Helper: compute XGB score for a close window + candle window
+    def _calc_xgb(w_close, w_df, model, tf, period):
+        std_dev, pearson_r, slope, intercept = calc_log_regression(w_close, period)
+        r_abs = abs(pearson_r)
+        pvt_arr = compute_pvt(w_df)
+        _, pvt_r, _, _ = calc_linear_regression(pvt_arr, min(period, len(pvt_arr)))
+        pvt_r_abs = abs(pvt_r)
+        xgb_score = predict_probability(model, confidence=r_abs, pvt_r=pvt_r_abs,
+                                        best_tf=tf, best_period=period)
+        return xgb_score, r_abs, pvt_r_abs
+
     # ── Rolling XGB/R computation per candle ──
     rolling_xgb = []
     rolling_r = []
     rolling_pvt_r = []
     rolling_ts = []
     rolling_pct = []
-    rolling_status = []
     xgb_direction = 0
+
+    # Live probe values (computed after historical)
+    live_xgb = np.nan
+    live_r = np.nan
+    live_pvt_r = np.nan
+    live_pct = 0.0
+    live_now_ts = None
 
     try:
         from neo_flow.adaptive_engine import calc_log_regression, compute_pvt, calc_linear_regression
@@ -1317,257 +1372,293 @@ def render_charting(state: dict, trades_df: pd.DataFrame):
             for i in range(chart_period, len(df_candles) + 1):
                 window_close = close_arr[i - chart_period:i]
                 try:
-                    std_dev, pearson_r, slope, intercept = calc_log_regression(window_close, chart_period)
-                    r_abs = abs(pearson_r)
-                    window_df = df_candles.iloc[i - chart_period:i]
-                    pvt_arr = compute_pvt(window_df)
-                    _, pvt_r, _, _ = calc_linear_regression(pvt_arr, min(chart_period, len(pvt_arr)))
-                    pvt_r_abs = abs(pvt_r)
-
-                    xgb_score = predict_probability(
-                        xgb_model, confidence=r_abs, pvt_r=pvt_r_abs,
-                        best_tf=selected_tf, best_period=chart_period,
-                    )
-
+                    xgb_score, r_abs, pvt_r_abs = _calc_xgb(
+                        window_close, df_candles.iloc[i - chart_period:i],
+                        xgb_model, selected_tf, chart_period)
                     p_val = _score_to_percentile(distributions, selected_tf, xgb_score)
-
-                    if xgb_score >= p50_threshold:
-                        status = "STRONG"
-                    elif xgb_score >= exit_threshold:
-                        status = "ACTIVE"
-                    else:
-                        status = "EXHAUSTED"
-
                     rolling_xgb.append(xgb_score)
                     rolling_r.append(r_abs)
                     rolling_pvt_r.append(pvt_r_abs)
                     rolling_ts.append(df_candles.index[i - 1])
                     rolling_pct.append(p_val)
-                    rolling_status.append(status)
                 except Exception:
                     rolling_xgb.append(np.nan)
                     rolling_r.append(np.nan)
                     rolling_pvt_r.append(np.nan)
                     rolling_ts.append(df_candles.index[i - 1])
                     rolling_pct.append(0.0)
-                    rolling_status.append("DATA_LAG")
 
             # Direction from latest regression slope
             if channel is not None:
                 xgb_direction = 1 if channel["slope"] < 0 else -1
+
+            # ── Live probe: inject 5m close into the last HTF window ──
+            if needs_live_probe and live_5m_close is not None and xgb_model is not None:
+                try:
+                    live_close_arr = close_arr.copy()
+                    live_close_arr[-1] = live_5m_close
+                    live_df = df_candles.copy()
+                    live_df.iloc[-1, live_df.columns.get_loc("close")] = live_5m_close
+                    live_window_close = live_close_arr[-chart_period:]
+                    live_window_df = live_df.iloc[-chart_period:]
+                    live_xgb, live_r, live_pvt_r = _calc_xgb(
+                        live_window_close, live_window_df,
+                        xgb_model, selected_tf, chart_period)
+                    live_pct = _score_to_percentile(distributions, selected_tf, live_xgb)
+                    live_now_ts = pd.Timestamp.now(tz="UTC")
+                except Exception:
+                    pass
     except Exception:
         pass
 
-    # Current values (latest point in rolling series)
-    xgb_prob = rolling_xgb[-1] if rolling_xgb and not np.isnan(rolling_xgb[-1]) else 0.0
-    pearson_r_val = rolling_r[-1] if rolling_r and not np.isnan(rolling_r[-1]) else 0.0
-    pvt_r_val = rolling_pvt_r[-1] if rolling_pvt_r and not np.isnan(rolling_pvt_r[-1]) else 0.0
-    p_value = rolling_pct[-1] if rolling_pct else 0.0
+    # Use live values if available, else fall back to last historical
+    if not np.isnan(live_xgb):
+        xgb_prob = live_xgb
+        pearson_r_val = live_r
+        pvt_r_val = live_pvt_r
+        p_value = live_pct
+    else:
+        xgb_prob = rolling_xgb[-1] if rolling_xgb and not np.isnan(rolling_xgb[-1]) else 0.0
+        pearson_r_val = rolling_r[-1] if rolling_r and not np.isnan(rolling_r[-1]) else 0.0
+        pvt_r_val = rolling_pvt_r[-1] if rolling_pvt_r and not np.isnan(rolling_pvt_r[-1]) else 0.0
+        p_value = rolling_pct[-1] if rolling_pct else 0.0
 
-    # ── Build dual-axis chart: Price + XGB/R overlay ──
+    # ── ClearView: auto-zoom for active positions ──
+    has_active_pos = selected_asset in positions
+    current_price = live_5m_close if live_5m_close is not None else float(df_candles["close"].iloc[-1])
+    timestamps = df_candles.index
+    candle_delta = (timestamps[-1] - timestamps[-2]) if len(timestamps) >= 2 else pd.Timedelta(minutes=5)
+
+    clearview_x0, clearview_x1 = None, None
+    if has_active_pos:
+        try:
+            entry_dt = pd.Timestamp(positions[selected_asset]["entry_ts"])
+            if entry_dt.tzinfo is None:
+                entry_dt = entry_dt.tz_localize("UTC")
+            entry_idx = abs(timestamps - entry_dt).argmin()
+            clearview_x0 = timestamps[max(0, entry_idx - 15)]
+            clearview_x1 = (live_now_ts if live_now_ts else timestamps[-1]) + 3 * candle_delta
+        except Exception:
+            pass
+
+    # ── Build chart: Row 1 = Price (70%), Row 2 = Signal (30%) ──
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.82, 0.18], vertical_spacing=0.03,
-        specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
+        row_heights=[0.70, 0.30], vertical_spacing=0.03,
     )
 
-    timestamps = df_candles.index
-
-    # Candlestick (primary Y)
+    # ── ROW 1: Clean price chart ──
     fig.add_trace(go.Candlestick(
         x=timestamps, open=df_candles["open"], high=df_candles["high"],
-        low=df_candles["low"], close=df_candles["close"], name="Price",
+        low=df_candles["low"], close=df_candles["close"],
         increasing_line_color="#00d97e", decreasing_line_color="#e63757",
         increasing_fillcolor="#00d97e", decreasing_fillcolor="#e63757",
-    ), row=1, col=1, secondary_y=False)
+        showlegend=False,
+    ), row=1, col=1)
 
-    # Regression channel (primary Y)
+    # Regression channel (no legend, minimal)
     if channel is not None:
         period = channel["period"]
-        ch_timestamps = timestamps[-period:]
-        fig.add_trace(go.Scatter(x=ch_timestamps, y=channel["upper"], mode="lines",
-            name="Upper (+1\u03c3)", line=dict(color="rgba(249,115,22,0.5)", width=1, dash="dot")),
-            row=1, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=ch_timestamps, y=channel["midline"], mode="lines",
-            name="Midline", line=dict(color="#f59e0b", width=2)),
-            row=1, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=ch_timestamps, y=channel["lower"], mode="lines",
-            name="Lower (-1\u03c3)", line=dict(color="rgba(249,115,22,0.5)", width=1, dash="dot")),
-            row=1, col=1, secondary_y=False)
+        ch_ts = timestamps[-period:]
+        fig.add_trace(go.Scatter(x=ch_ts, y=channel["upper"], mode="lines",
+            line=dict(color="rgba(249,115,22,0.35)", width=1, dash="dot"),
+            showlegend=False, hoverinfo="skip"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=ch_ts, y=channel["midline"], mode="lines",
+            line=dict(color="rgba(245,158,11,0.6)", width=1.5),
+            showlegend=False, hoverinfo="skip"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=ch_ts, y=channel["lower"], mode="lines",
+            line=dict(color="rgba(249,115,22,0.35)", width=1, dash="dot"),
+            showlegend=False, hoverinfo="skip"), row=1, col=1)
 
-    # Open position overlays (primary Y)
-    if selected_asset in positions:
+    # ── HUD-style trade levels (right-side Y-axis price tags only) ──
+    if has_active_pos:
         pos = positions[selected_asset]
-        fig.add_hline(y=pos["entry_price"], line_dash="dot", line_color="#39afd1",
-            annotation_text=f"Entry: {pos['entry_price']:.6f}", annotation_font_color="#39afd1", row=1, col=1)
-        fig.add_hline(y=pos["hard_sl"], line_dash="dash", line_color="#e63757",
-            annotation_text=f"Hard SL 1.5%: {pos['hard_sl']:.6f}", annotation_font_color="#e63757", row=1, col=1)
+        entry_p = pos["entry_price"]
+        hard_sl = pos["hard_sl"]
 
-    # Historical trade markers (primary Y)
+        fig.add_hline(y=entry_p, line_dash="dot", line_color="#39afd1", line_width=1.5,
+            annotation_text=f" {entry_p:.6g} ",
+            annotation_position="right",
+            annotation_font=dict(color="#0e1117", size=10),
+            annotation_bgcolor="#39afd1", annotation_borderpad=2,
+            row=1, col=1)
+        fig.add_hline(y=hard_sl, line_dash="dash", line_color="#ef4444", line_width=1.5,
+            annotation_text=f" SL {hard_sl:.6g} ",
+            annotation_position="right",
+            annotation_font=dict(color="#ffffff", size=10),
+            annotation_bgcolor="#ef4444", annotation_borderpad=2,
+            row=1, col=1)
+
+        try:
+            entry_dt = pd.Timestamp(pos["entry_ts"])
+            if entry_dt.tzinfo is None:
+                entry_dt = entry_dt.tz_localize("UTC")
+            fig.add_trace(go.Scatter(
+                x=[entry_dt], y=[entry_p], mode="markers",
+                marker=dict(symbol="diamond", size=10, color="#10b981",
+                            line=dict(width=1.5, color="white")),
+                showlegend=False,
+                hovertemplate=f"Entry: {entry_p:.6f}<extra></extra>",
+            ), row=1, col=1)
+        except Exception:
+            pass
+
+    # Historical trade markers (compact, no legend)
     if not trades_df.empty:
-        asset_trades = trades_df[trades_df["asset"] == selected_asset].copy()
+        asset_trades = trades_df[trades_df["asset"] == selected_asset]
         if not asset_trades.empty:
             for _, t in asset_trades.iterrows():
-                color = "#00d97e" if t.get("direction") in [1, "LONG"] else "#e63757"
-                marker_sym = "triangle-up" if t.get("direction") in [1, "LONG"] else "triangle-down"
-                fig.add_trace(go.Scatter(x=[t["entry_ts"]], y=[t["entry_price"]], mode="markers",
-                    marker=dict(symbol=marker_sym, size=14, color=color, line=dict(width=1, color="white")),
-                    showlegend=False, hovertemplate=f"ENTRY {t['entry_price']:.6f}<extra></extra>"),
-                    row=1, col=1, secondary_y=False)
-            for _, t in asset_trades.iterrows():
-                pnl = t.get("pnl_pct", 0)
-                exit_reason = t.get("exit_reason", "")
-                color = "#00d97e" if pnl > 0 else "#e63757"
-                marker_sym = "star" if exit_reason == "P_FLOOR_EXIT" else "x"
-                fig.add_trace(go.Scatter(x=[t["exit_ts"]], y=[t["exit_price"]], mode="markers",
-                    marker=dict(symbol=marker_sym, size=12, color=color, line=dict(width=2, color=color)),
+                is_long = t.get("direction") in [1, "LONG"]
+                fig.add_trace(go.Scatter(
+                    x=[t["entry_ts"]], y=[t["entry_price"]], mode="markers",
+                    marker=dict(symbol="triangle-up" if is_long else "triangle-down",
+                                size=10, color="#00d97e" if is_long else "#e63757",
+                                line=dict(width=1, color="white")),
                     showlegend=False,
-                    hovertemplate=f"EXIT {t['exit_price']:.6f} ({pnl:+.2f}%)<br>{exit_reason}<extra></extra>"),
-                    row=1, col=1, secondary_y=False)
+                    hovertemplate=f"ENTRY {t['entry_price']:.6f}<extra></extra>",
+                ), row=1, col=1)
+                pnl = t.get("pnl_pct", 0)
+                fig.add_trace(go.Scatter(
+                    x=[t["exit_ts"]], y=[t["exit_price"]], mode="markers",
+                    marker=dict(symbol="star" if t.get("exit_reason", "").startswith("P_FLOOR_EXIT") else "x",
+                                size=9, color="#00d97e" if pnl > 0 else "#e63757"),
+                    showlegend=False,
+                    hovertemplate=f"EXIT {t['exit_price']:.6f} ({pnl:+.2f}%)<br>{t.get('exit_reason','')}<extra></extra>",
+                ), row=1, col=1)
 
-    # ── XGB Indicator Line (secondary Y, color-segmented by P-Matrix zones) ──
+    # ── ClearView HUD annotation (uses LIVE values) ──
+    buffer_to_pfloor = xgb_prob - exit_threshold
+    is_live = not np.isnan(live_xgb) and needs_live_probe
+    hud_live_tag = "  <b>LIVE</b>" if is_live else ""
+    if xgb_prob < exit_threshold:
+        hud_border, hud_bg = "#ef4444", "rgba(69,10,10,0.90)"
+    elif xgb_prob < p50_threshold:
+        hud_border, hud_bg = "#f97316", "rgba(69,38,3,0.90)"
+    else:
+        hud_border, hud_bg = "#10b981", "rgba(6,78,59,0.90)"
+    fig.add_annotation(
+        xref="x domain", yref="y domain", x=0.01, y=0.97,
+        text=(f"<b>P{min(p_value,100):.0f}</b>  XGB {xgb_prob:.4f}  "
+              f"Dist {buffer_to_pfloor:+.4f}  "
+              f"Floor P{tf_matrix['exit_p']*100:.0f}{hud_live_tag}"),
+        showarrow=False,
+        font=dict(family="Courier New", size=11, color="#e2e8f0"),
+        align="left", bordercolor=hud_border, borderwidth=2,
+        bgcolor=hud_bg, borderpad=6,
+        row=1, col=1,
+    )
+
+    # ── ROW 2: XGB Signal Subplot ──
     if rolling_xgb and rolling_ts:
-        # Build color-segmented line: Green >P50, Yellow P-Exit..P50, Red <P-Exit
+        # Historical: solid color-coded segments
         segments = []
         seg_x, seg_y, seg_hover = [], [], []
-        current_color = None
+        cur_col = None
 
-        for idx in range(len(rolling_xgb)):
-            ts = rolling_ts[idx]
-            xval = rolling_xgb[idx]
-            rval = rolling_r[idx]
-            pval = rolling_pct[idx]
-            sval = rolling_status[idx]
-
-            # DATA_LAG gap — break the line
+        for i in range(len(rolling_xgb)):
+            xval = rolling_xgb[i]
             if np.isnan(xval):
                 if seg_x:
-                    segments.append((current_color, seg_x[:], seg_y[:], seg_hover[:]))
-                    seg_x, seg_y, seg_hover = [], [], []
-                    current_color = None
+                    segments.append((cur_col, seg_x[:], seg_y[:], seg_hover[:]))
+                    seg_x, seg_y, seg_hover, cur_col = [], [], [], None
                 continue
-
-            if xval >= p50_threshold:
-                color = "#10b981"  # green — strong
-            elif xval >= exit_threshold:
-                color = "#fbbf24"  # yellow — active
-            else:
-                color = "#ef4444"  # red — exhausted
-
-            r_disp = f"{rval:.4f}" if not np.isnan(rval) else "N/A"
-            hover = (f"XGB: {xval:.4f}  |  |R|: {r_disp}<br>"
-                     f"Percentile: P{min(pval, 100):.0f}  |  Status: {sval}")
-
-            if color != current_color and seg_x:
-                # Overlap last point into new segment for line continuity
-                segments.append((current_color, seg_x[:], seg_y[:], seg_hover[:]))
-                seg_x = [seg_x[-1]]
-                seg_y = [seg_y[-1]]
-                seg_hover = [seg_hover[-1]]
-                current_color = color
-            elif current_color is None:
-                current_color = color
-
-            seg_x.append(ts)
+            color = ("#10b981" if xval >= p50_threshold
+                     else "#f97316" if xval >= exit_threshold
+                     else "#ef4444")
+            pval = rolling_pct[i]
+            hover = f"XGB: {xval:.4f}  P{min(pval,100):.0f}"
+            if color != cur_col and seg_x:
+                segments.append((cur_col, seg_x[:], seg_y[:], seg_hover[:]))
+                seg_x, seg_y, seg_hover = [seg_x[-1]], [seg_y[-1]], [seg_hover[-1]]
+                cur_col = color
+            elif cur_col is None:
+                cur_col = color
+            seg_x.append(rolling_ts[i])
             seg_y.append(xval)
             seg_hover.append(hover)
-
         if seg_x:
-            segments.append((current_color, seg_x, seg_y, seg_hover))
+            segments.append((cur_col, seg_x, seg_y, seg_hover))
 
-        # Draw segments on secondary Y
-        first_seg = True
-        for seg_color, sx, sy, sh in segments:
+        for seg_col, sx, sy, sh in segments:
             fig.add_trace(go.Scatter(
-                x=sx, y=sy, mode="lines+markers",
-                line=dict(color=seg_color, width=2.5),
-                marker=dict(size=3, color=seg_color),
-                name="XGB Score" if first_seg else None,
-                showlegend=first_seg,
-                text=sh, hoverinfo="text",
-                connectgaps=False,
-            ), row=1, col=1, secondary_y=True)
-            first_seg = False
+                x=sx, y=sy, mode="lines", line=dict(color=seg_col, width=2),
+                showlegend=False, text=sh, hoverinfo="text", connectgaps=False,
+            ), row=2, col=1)
 
-        # DATA_LAG grey markers for NaN gaps
-        lag_ts = [rolling_ts[i] for i in range(len(rolling_xgb)) if np.isnan(rolling_xgb[i])]
-        if lag_ts:
+        # ── Live Bar: dotted extension from last historical to NOW ──
+        if is_live and live_now_ts is not None and rolling_xgb and not np.isnan(rolling_xgb[-1]):
+            last_hist_ts = rolling_ts[-1]
+            last_hist_val = rolling_xgb[-1]
+            live_color = ("#10b981" if live_xgb >= p50_threshold
+                          else "#f97316" if live_xgb >= exit_threshold
+                          else "#ef4444")
+            # Dotted connector line: last confirmed -> live
             fig.add_trace(go.Scatter(
-                x=lag_ts, y=[0.5] * len(lag_ts), mode="markers",
-                marker=dict(size=6, color="rgba(100,116,139,0.6)", symbol="diamond"),
-                name="DATA_LAG", showlegend=True,
-                hovertext=["DATA_LAG — Missing signal data"] * len(lag_ts),
+                x=[last_hist_ts, live_now_ts],
+                y=[last_hist_val, live_xgb],
+                mode="lines", line=dict(color=live_color, width=2, dash="dot"),
+                showlegend=False, hoverinfo="skip",
+            ), row=2, col=1)
+            # Glowing live marker at current moment
+            fig.add_trace(go.Scatter(
+                x=[live_now_ts], y=[live_xgb],
+                mode="markers",
+                marker=dict(size=10, color=live_color,
+                            line=dict(width=2, color="white"),
+                            symbol="circle"),
+                showlegend=False,
+                text=[f"LIVE XGB: {live_xgb:.4f}  P{min(live_pct,100):.0f}"],
                 hoverinfo="text",
-            ), row=1, col=1, secondary_y=True)
+            ), row=2, col=1)
 
-        # Pearson |R| line (thin dashed, secondary Y)
-        valid_r_ts = [rolling_ts[i] for i in range(len(rolling_r)) if not np.isnan(rolling_r[i])]
-        valid_r_vals = [rolling_r[i] for i in range(len(rolling_r)) if not np.isnan(rolling_r[i])]
-        if valid_r_ts:
-            fig.add_trace(go.Scatter(
-                x=valid_r_ts, y=valid_r_vals, mode="lines",
-                line=dict(color="rgba(148,163,184,0.5)", width=1.5, dash="dot"),
-                name="Pearson |R|", showlegend=True,
-                hoverinfo="skip",
-            ), row=1, col=1, secondary_y=True)
+        # Threshold lines
+        fig.add_hline(y=entry_threshold, line_dash="dash", line_color="#10b981", line_width=1,
+            annotation_text=f"Entry P{tf_matrix['entry_p']*100:.0f}",
+            annotation_position="right",
+            annotation_font=dict(color="#10b981", size=9),
+            row=2, col=1)
+        fig.add_hline(y=exit_threshold, line_dash="dash", line_color="#ef4444", line_width=1.5,
+            annotation_text=f"P-Floor P{tf_matrix['exit_p']*100:.0f}",
+            annotation_position="right",
+            annotation_font=dict(color="#ef4444", size=9),
+            row=2, col=1)
 
-        # P-Matrix threshold reference lines on secondary Y
-        x_range = [rolling_ts[0], rolling_ts[-1]]
-
-        # Entry barrier (green dashed)
-        fig.add_trace(go.Scatter(
-            x=x_range, y=[entry_threshold, entry_threshold], mode="lines",
-            line=dict(color="rgba(16,185,129,0.6)", width=1.5, dash="dash"),
-            name=f"Entry P{tf_matrix['entry_p']*100:.0f}: {entry_threshold:.4f}",
-            showlegend=True, hoverinfo="skip",
-        ), row=1, col=1, secondary_y=True)
-
-        # Exit floor (red dashed)
-        fig.add_trace(go.Scatter(
-            x=x_range, y=[exit_threshold, exit_threshold], mode="lines",
-            line=dict(color="rgba(239,68,68,0.6)", width=1.5, dash="dash"),
-            name=f"P-Floor P{tf_matrix['exit_p']*100:.0f}: {exit_threshold:.4f}",
-            showlegend=True, hoverinfo="skip",
-        ), row=1, col=1, secondary_y=True)
-
-        # P50 midline (yellow dotted)
-        fig.add_trace(go.Scatter(
-            x=x_range, y=[p50_threshold, p50_threshold], mode="lines",
-            line=dict(color="rgba(251,191,36,0.35)", width=1, dash="dot"),
-            name=f"P50: {p50_threshold:.4f}",
-            showlegend=True, hoverinfo="skip",
-        ), row=1, col=1, secondary_y=True)
-
-    # Volume (row 2)
-    vol_colors = ["#00d97e" if c >= o else "#e63757" for c, o in zip(df_candles["close"], df_candles["open"])]
-    fig.add_trace(go.Bar(x=timestamps, y=df_candles["volume"], name="Volume",
-        marker_color=vol_colors, opacity=0.5, showlegend=False), row=2, col=1)
-
-    # Layout
+    # ── Layout: dark, clean, no legend, no rangeslider ──
     fig.update_layout(
-        template="plotly_dark", height=800,
+        template="plotly_dark", height=820,
         paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-        margin=dict(l=60, r=60, t=40, b=30),
+        margin=dict(l=55, r=55, t=30, b=25),
+        showlegend=False,
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
-                    font=dict(size=10)),
+        xaxis2_rangeslider_visible=False,
     )
-    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="XGB / |R|", row=1, col=1, secondary_y=True,
-                     range=[0, 1.05], showgrid=False,
-                     tickformat=".2f", tickvals=[0, 0.25, 0.5, 0.75, 1.0])
-    fig.update_yaxes(title_text="Vol", row=2, col=1)
+    fig.update_yaxes(title_text="Price", title_font_size=11, row=1, col=1)
+    fig.update_yaxes(title_text="XGB", title_font_size=11, row=2, col=1,
+                     range=[0, 1.05], tickformat=".2f",
+                     tickvals=[0, 0.25, 0.5, 0.75, 1.0])
+
+    # ClearView: auto-zoom X-axis to focus on active trade window
+    if has_active_pos and clearview_x0 is not None:
+        fig.update_xaxes(range=[clearview_x0, clearview_x1], row=1, col=1)
+        fig.update_xaxes(range=[clearview_x0, clearview_x1], row=2, col=1)
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # Metrics row — P-Matrix focused
+    # ClearView Metrics row (uses live values)
     sentiment_label = "BULLISH" if xgb_direction == 1 else "BEARISH" if xgb_direction == -1 else "NEUTRAL"
-    ic1, ic2, ic3, ic4, ic5, ic6 = st.columns(6)
+    ic1, ic2, ic3, ic4, ic5, ic6, ic7 = st.columns(7)
     ic1.metric("Pearson |R|", f"{pearson_r_val:.4f}")
     ic2.metric("PVT |R|", f"{pvt_r_val:.4f}")
-    ic3.metric("XGB Score", f"{xgb_prob:.4f}")
+    ic3.metric("XGB Score", f"{xgb_prob:.4f}",
+               delta=f"LIVE" if is_live else None,
+               delta_color="off")
     ic4.metric("P-Value", f"P{p_value:.0f}")
     ic5.metric("Leverage", f"{tf_matrix['leverage']}x")
+    dist_val = buffer_to_pfloor
+    dist_color = "normal" if dist_val > 0 else "inverse"
+    ic6.metric("Dist to P-Exit", f"{dist_val:+.4f}",
+               delta=f"P{tf_matrix['exit_p']*100:.0f} Floor",
+               delta_color="off")
     if xgb_prob <= 0:
         health = "N/A"
     elif xgb_prob < exit_threshold:
@@ -1576,7 +1667,7 @@ def render_charting(state: dict, trades_df: pd.DataFrame):
         health = "ACTIVE"
     else:
         health = "STRONG"
-    ic6.metric("Signal", f"{sentiment_label} ({health})")
+    ic7.metric("Signal", f"{sentiment_label} ({health})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2078,7 +2169,7 @@ def render_signal_health(state: dict, prices: dict):
         cutoff = now_utc - timedelta(minutes=5)
         try:
             ts_col = pd.to_datetime(trades_df["exit_ts"], utc=True, errors="coerce")
-            recent = trades_df[(ts_col >= cutoff) & (trades_df["exit_reason"] == "P_FLOOR_EXIT")]
+            recent = trades_df[(ts_col >= cutoff) & (trades_df["exit_reason"].str.startswith("P_FLOOR_EXIT", na=False))]
             for _, trade in recent.iterrows():
                 asset = trade.get("asset", "?")
                 pnl = trade.get("pnl_pct", 0.0)

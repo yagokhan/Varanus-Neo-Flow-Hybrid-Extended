@@ -35,15 +35,16 @@ from config.groups import (
 # Config
 # ═══════════════════════════════════════════════════════════════════════════════
 
-STATE_FILE = BASE_DIR / "live_extended_state.json"
-TRADES_FILE = BASE_DIR / "live_extended_trades.csv"
-SCAN_LOG_FILE = BASE_DIR / "logs" / "scan_results.json"
+STATE_FILE = BASE_DIR / "live_extended_v1_state.json"
+TRADES_FILE = BASE_DIR / "live_extended_v1_trades.csv"
+SCAN_LOG_FILE = BASE_DIR / "logs" / "scan_results_v1.json"
 DASHBOARD_SCAN_CACHE = BASE_DIR / "logs" / "dashboard_scan_cache.json"
-DASHBOARD_5M_SCAN_CACHE = BASE_DIR / "logs" / "dashboard_5m_scan_cache.json"
 WFV_FILE = BASE_DIR / "wfv_results.json"
 OPTIMIZED_THRESHOLDS_FILE = BASE_DIR / "config" / "optimized_thresholds.json"
-LOG_FILE = BASE_DIR / "logs" / "live_extended_bot.log"
+LOG_FILE = BASE_DIR / "logs" / "live_extended_v1.log"
 DATA_DIR = BASE_DIR / "data"
+XGB_MODEL_PATH = BASE_DIR / "models" / "meta_xgb.json"
+DECAY_HISTORY_FILE = BASE_DIR / "logs" / "signal_decay_history.json"
 
 BINANCE_PRICES_URL = "https://api.binance.com/api/v3/ticker/price"
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
@@ -127,6 +128,227 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# Signal Health Monitor styles
+st.markdown("""
+<style>
+    .sh-data-lag {
+        background: #451a03; border: 1px solid #92400e; border-radius: 8px;
+        padding: 8px 14px; color: #fbbf24; font-weight: 600; margin-bottom: 6px;
+    }
+    .sh-zero-floor {
+        background: #450a0a; border: 1px solid #991b1b; border-radius: 8px;
+        padding: 8px 14px; color: #f87171; font-weight: 600; margin-bottom: 6px;
+    }
+    .sh-badge-green {
+        background: #064e3b; color: #34d399; padding: 3px 10px;
+        border-radius: 12px; font-weight: 600; font-size: 0.78rem; display: inline-block;
+    }
+    .sh-badge-yellow {
+        background: #451a03; color: #fbbf24; padding: 3px 10px;
+        border-radius: 12px; font-weight: 600; font-size: 0.78rem; display: inline-block;
+    }
+    .sh-badge-red {
+        background: #450a0a; color: #f87171; padding: 3px 10px;
+        border-radius: 12px; font-weight: 600; font-size: 0.78rem; display: inline-block;
+    }
+    .sh-badge-gray {
+        background: #1e293b; color: #94a3b8; padding: 3px 10px;
+        border-radius: 12px; font-weight: 600; font-size: 0.78rem; display: inline-block;
+    }
+    .cd-timer {
+        font-family: 'Courier New', monospace; font-size: 1.1rem;
+        color: #f87171; font-weight: 700;
+    }
+    .audit-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    .audit-table th {
+        background: #1e2235; color: #94a3b8; padding: 10px 14px;
+        text-align: left; font-weight: 600; border-bottom: 2px solid #334155;
+    }
+    .audit-table td {
+        padding: 10px 14px; border-bottom: 1px solid #1e2235; color: #e2e8f0;
+    }
+    .audit-table tr:hover { background: #1e293b40; }
+    .toast-exit {
+        background: linear-gradient(135deg, #064e3b, #065f46); border: 1px solid #34d399;
+        border-radius: 12px; padding: 14px 20px; color: #ecfdf5;
+        font-weight: 600; margin-bottom: 10px;
+    }
+    .decay-flash { animation: decayPulse 1s ease-in-out infinite; }
+    @keyframes decayPulse {
+        0%, 100% { background-color: transparent; }
+        50% { background-color: #451a03; }
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# P-Matrix Constants & Percentile Engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TF_MATRIX = {
+    "5m":  {"entry_p": 0.80, "exit_p": 0.30, "leverage": 1},
+    "30m": {"entry_p": 0.75, "exit_p": 0.20, "leverage": 3},
+    "1h":  {"entry_p": 0.70, "exit_p": 0.15, "leverage": 5},
+    "4h":  {"entry_p": 0.70, "exit_p": 0.15, "leverage": 5},
+}
+
+DECAY_DROP_THRESHOLD = 0.10
+DECAY_WINDOW_MINUTES = 15
+
+
+@st.cache_data(ttl=300)
+def _build_percentile_distributions() -> dict[str, np.ndarray]:
+    """Build XGB score distributions from historical trades, keyed by TF."""
+    try:
+        from ml.train_meta_model import load_model, predict_probability
+        model, _ = load_model(XGB_MODEL_PATH)
+    except Exception:
+        return {}
+
+    csv_candidates = [
+        BASE_DIR / "blind_test_trades.csv",
+        BASE_DIR / "extended_trades_hybrid.csv",
+        BASE_DIR / "extended_trades_physics.csv",
+        BASE_DIR / "live_extended_v1_trades.csv",
+    ]
+    frames = []
+    for path in csv_candidates:
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path)
+            df.columns = [c.strip().lower() for c in df.columns]
+            required = {"confidence", "pvt_r", "best_tf", "best_period"}
+            if required.issubset(set(df.columns)):
+                frames.append(df)
+        except Exception:
+            continue
+    if not frames:
+        return {}
+
+    combined = pd.concat(frames, ignore_index=True)
+    dedup_cols = [c for c in ["asset", "entry_ts", "exit_ts", "entry_price"] if c in combined.columns]
+    if dedup_cols:
+        combined = combined.drop_duplicates(subset=dedup_cols)
+
+    scores = []
+    for _, row in combined.iterrows():
+        try:
+            s = predict_probability(model, confidence=float(row["confidence"]),
+                                    pvt_r=float(row["pvt_r"]), best_tf=str(row["best_tf"]),
+                                    best_period=int(row["best_period"]))
+            scores.append(s)
+        except Exception:
+            scores.append(np.nan)
+    combined["xgb_score"] = scores
+    combined = combined.dropna(subset=["xgb_score"])
+
+    distributions: dict[str, np.ndarray] = {}
+    for tf in ["5m", "30m", "1h", "4h"]:
+        tf_scores = combined.loc[combined["best_tf"] == tf, "xgb_score"].values
+        if len(tf_scores) >= 10:
+            distributions[tf] = np.sort(tf_scores)
+    all_scores = combined["xgb_score"].values
+    if len(all_scores) >= 10:
+        distributions["GLOBAL"] = np.sort(all_scores)
+    return distributions
+
+
+def _score_to_percentile(distributions: dict, tf: str, score: float) -> float:
+    """Convert XGB score to percentile rank within TF distribution. Clamped to P100."""
+    dist = distributions.get(tf, distributions.get("GLOBAL"))
+    if dist is None or len(dist) == 0:
+        return 0.0
+    pct = float(np.searchsorted(dist, score, side="right")) / len(dist) * 100
+    return min(pct, 100.0)
+
+
+def _get_pmatrix_threshold(distributions: dict, tf: str, percentile: float) -> float:
+    """Get XGB score at a given percentile for a TF."""
+    dist = distributions.get(tf, distributions.get("GLOBAL"))
+    if dist is None or len(dist) == 0:
+        return percentile
+    return float(np.percentile(dist, percentile * 100))
+
+
+def _validate_position(pos: dict, distributions: dict) -> dict:
+    """Run integrity checks on a single position. Returns enriched dict."""
+    tf = pos.get("best_tf", "5m")
+    xgb = pos.get("xgb_prob", 0.0)
+    confidence = pos.get("confidence", 0.0)
+    p_exit = pos.get("p_exit_threshold", 0.0)
+    matrix = TF_MATRIX.get(tf, TF_MATRIX["4h"])
+
+    p_value = _score_to_percentile(distributions, tf, xgb)
+    exit_threshold = _get_pmatrix_threshold(distributions, tf, matrix["exit_p"])
+
+    flags = []
+    dist = distributions.get(tf, distributions.get("GLOBAL"))
+    is_p100 = False
+    if dist is not None and len(dist) > 0 and xgb >= dist[-1]:
+        p_value = 100.0
+        is_p100 = True
+
+    has_data_lag = (xgb <= 0.0 or confidence <= 0.0)
+    if has_data_lag:
+        flags.append("DATA_LAG")
+
+    has_zero_floor = (p_exit <= 0.001)
+    if has_zero_floor:
+        flags.append("ZERO_FLOOR")
+
+    p50_threshold = _get_pmatrix_threshold(distributions, tf, 0.50)
+    if has_data_lag:
+        status, status_color = "DATA_LAG", "yellow"
+    elif xgb < exit_threshold:
+        status, status_color = "EXHAUSTED", "red"
+    elif xgb < p50_threshold:
+        status, status_color = "DECLINING", "yellow"
+    else:
+        status, status_color = "HEALTHY", "green"
+
+    return {**pos, "p_value": round(p_value, 1), "is_p100": is_p100,
+            "exit_threshold_actual": round(exit_threshold, 4),
+            "status": status, "status_color": status_color, "flags": flags,
+            "has_data_lag": has_data_lag, "has_zero_floor": has_zero_floor, "matrix": matrix}
+
+
+def _check_signal_decay(positions: dict) -> dict[str, dict]:
+    """Track XGB changes over time. Flag if drop > 0.10 in 15min."""
+    now = datetime.now(timezone.utc)
+    try:
+        history = json.loads(DECAY_HISTORY_FILE.read_text())
+    except Exception:
+        history = {}
+    results = {}
+    for asset, pos in positions.items():
+        xgb = pos.get("xgb_prob", 0.0)
+        if xgb <= 0:
+            continue
+        asset_hist = history.get(asset, [])
+        asset_hist.append({"ts": now.isoformat(), "score": xgb})
+        cutoff = (now - timedelta(minutes=30)).isoformat()
+        asset_hist = [h for h in asset_hist if h["ts"] >= cutoff]
+        history[asset] = asset_hist
+        window_cutoff = (now - timedelta(minutes=DECAY_WINDOW_MINUTES)).isoformat()
+        window_entries = [h for h in asset_hist if h["ts"] >= window_cutoff]
+        decaying, drop, peak_in_window = False, 0.0, xgb
+        if len(window_entries) >= 2:
+            peak_in_window = max(h["score"] for h in window_entries)
+            drop = peak_in_window - xgb
+            if drop >= DECAY_DROP_THRESHOLD:
+                decaying = True
+        results[asset] = {"decaying": decaying, "drop": round(drop, 4),
+                          "peak": round(peak_in_window, 4), "current": round(xgb, 4)}
+    for asset in list(history.keys()):
+        if asset not in positions:
+            del history[asset]
+    try:
+        DECAY_HISTORY_FILE.write_text(json.dumps(history, indent=2))
+    except Exception:
+        pass
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -411,187 +633,6 @@ def run_dashboard_scan() -> list[dict]:
                  "first_fail": ""}]
 
 
-@st.cache_data(ttl=30)
-def run_dashboard_5m_scan() -> list[dict]:
-    """Run a READ-ONLY 5m-only scan of all 33 assets — mirrors bot's WS scan_5m_asset().
-    Only checks the 5m timeframe for regressions (like bot does between hourly scans)."""
-    try:
-        from neo_flow.adaptive_engine import (
-            find_best_regression, compute_pvt_regression, check_pvt_alignment,
-            get_htf_bias, check_combined_gate, trim_to_7d,
-        )
-        from ml.train_meta_model import predict_probability, load_model
-
-        xgb_model = None
-        xgb_path = BASE_DIR / "models" / "meta_xgb.json"
-        if xgb_path.exists():
-            xgb_model, _ = load_model(xgb_path)
-
-        results = []
-        for asset in ASSETS:
-            symbol = f"{asset}USDT"
-            group = get_group(asset)
-            gt = GROUP_THRESHOLDS.get(group, DEFAULT_THRESHOLDS[group])
-
-            # Only fetch 5m candles (matches bot WS-5m behavior)
-            scan_dfs = {}
-            df_5m = _fetch_live_candles(symbol, "5m", BARS_7D["5m"])
-            if not df_5m.empty:
-                scan_dfs["5m"] = df_5m
-
-            row = {
-                "asset": asset, "group": group, "best_r": 0, "pvt_r": 0,
-                "direction": 0, "best_tf": "-", "best_period": 0,
-                "midline": 0, "std_dev": 0, "xgb_prob": 0,
-                "gate_r": False, "gate_pvt": False, "gate_htf": False,
-                "gate_combined": False, "gate_xgb": False,
-                "reject_reason": "", "final_status": "no_signal",
-                "entry_price": 0,
-                "r_diff": 0.0, "pvt_diff": 0.0, "xgb_diff": 0.0,
-                "htf_bias_str": "-", "pvt_detail": "", "combined_detail": "",
-                "first_fail": "", "scan_type": "5m",
-            }
-
-            if not scan_dfs:
-                row["reject_reason"] = "No 5m data"
-                row["first_fail"] = "No Data"
-                results.append(row)
-                continue
-
-            best, all_regs = find_best_regression(scan_dfs)
-            if best is None:
-                row["reject_reason"] = "No valid 5m regression"
-                row["first_fail"] = "R-Gate"
-                results.append(row)
-                continue
-
-            abs_r = abs(best.pearson_r)
-            direction = 1 if best.slope < 0 else -1
-            row["best_r"] = round(abs_r, 4)
-            row["direction"] = direction
-            row["best_tf"] = best.timeframe
-            row["best_period"] = best.period
-            row["midline"] = round(best.midline, 6)
-            row["std_dev"] = round(best.std_dev, 6)
-            row["r_diff"] = round(abs_r - gt.min_confidence, 4)
-
-            best_df = scan_dfs.get(best.timeframe)
-            if best_df is not None and not best_df.empty:
-                row["entry_price"] = float(best_df.iloc[-1]["close"])
-
-            # Gate 1: Pearson R
-            if abs_r >= gt.min_confidence:
-                row["gate_r"] = True
-            else:
-                row["first_fail"] = row["first_fail"] or "R-Gate"
-                row["reject_reason"] = f"|R| {abs_r:.4f} < {gt.min_confidence}"
-
-            # Gate 2: PVT alignment
-            pvt_result = None
-            if best_df is not None and not best_df.empty:
-                best_df_7d = trim_to_7d(best_df, best.timeframe)
-                pvt_result = compute_pvt_regression(best_df_7d, best.period)
-                pvt_abs_r = abs(pvt_result.pearson_r)
-                row["pvt_r"] = round(pvt_abs_r, 4)
-                row["pvt_diff"] = round(pvt_abs_r - gt.min_pvt_r, 4)
-                pvt_dir_str = "RISING" if pvt_result.direction == 1 else ("FALLING" if pvt_result.direction == -1 else "FLAT")
-                row["pvt_detail"] = pvt_dir_str
-
-                if row["gate_r"]:
-                    pvt_passes, pvt_reason = check_pvt_alignment(direction, abs_r, pvt_result)
-                    if pvt_passes:
-                        row["gate_pvt"] = True
-                    else:
-                        row["first_fail"] = row["first_fail"] or "PVT-Gate"
-                        row["reject_reason"] = row["reject_reason"] or pvt_reason
-
-            # Gate 3: 4H HTF bias (still uses 4h data like bot does)
-            htf_bias = 0
-            df_4h = _fetch_live_candles(symbol, "4h", BARS_7D["4h"])
-            htf_detail = ""
-            if not df_4h.empty:
-                htf_bias = get_htf_bias(df_4h)
-                try:
-                    from neo_flow.adaptive_engine import detect_mss, compute_ema, MSS_LOOKBACK as _MSS_LB
-                    if len(df_4h) >= _MSS_LB + 1:
-                        _w = df_4h.iloc[-(_MSS_LB + 1):-1]
-                        _cur = df_4h.iloc[-1]
-                        _sh = float(_w["high"].max())
-                        _sl = float(_w["low"].min())
-                        _cp = float(_cur["close"])
-                        _to_bull = ((_sh - _cp) / _cp) * 100
-                        _to_bear = ((_cp - _sl) / _cp) * 100
-                        _ema_f = float(compute_ema(df_4h["close"], 21).iloc[-1])
-                        _ema_s = float(compute_ema(df_4h["close"], 55).iloc[-1])
-                        _ema_str = "EMA:Bull" if _ema_f > _ema_s else "EMA:Bear"
-                        htf_detail = f"{_ema_str} | +{_to_bull:.1f}%toHH -{_to_bear:.1f}%toLL"
-                except Exception:
-                    pass
-
-            row["htf_bias_str"] = {1: "BULL", -1: "BEAR", 0: "NEUTRAL"}.get(htf_bias, "?")
-            row["htf_detail"] = htf_detail
-            if row["gate_r"] and row["gate_pvt"]:
-                if htf_bias != 0 and htf_bias == direction:
-                    row["gate_htf"] = True
-                else:
-                    row["first_fail"] = row["first_fail"] or "4H-Trend"
-                    if htf_bias == 0:
-                        row["reject_reason"] = row["reject_reason"] or f"4H neutral ({htf_detail})"
-                    else:
-                        dir_s = "LONG" if direction == 1 else "SHORT"
-                        row["reject_reason"] = row["reject_reason"] or f"4H {row['htf_bias_str']} vs signal {dir_s}"
-
-            # Gate 4: Combined gate
-            combined_pass = check_combined_gate(direction, all_regs) if all_regs else True
-            max_opposing_r = 0.0
-            for r in all_regs:
-                r_dir = -1 if r.slope > 0 else (1 if r.slope < 0 else 0)
-                if r_dir != 0 and r_dir != direction:
-                    max_opposing_r = max(max_opposing_r, abs(r.pearson_r))
-            row["combined_detail"] = f"max_opp |R|={max_opposing_r:.4f}" if max_opposing_r > 0 else "no opposing"
-
-            if row["gate_r"] and row["gate_pvt"] and row["gate_htf"]:
-                if combined_pass:
-                    row["gate_combined"] = True
-                else:
-                    row["first_fail"] = row["first_fail"] or "Combined"
-                    row["reject_reason"] = row["reject_reason"] or f"Opposing |R| {max_opposing_r:.4f} > {gt.combined_gate}"
-
-            # Gate 5: XGBoost
-            if xgb_model is not None and pvt_result is not None:
-                xgb_prob = predict_probability(
-                    xgb_model, confidence=abs_r, pvt_r=abs(pvt_result.pearson_r),
-                    best_tf=best.timeframe, best_period=best.period, pnl_pct=0.0,
-                )
-                row["xgb_prob"] = round(xgb_prob, 4)
-                row["xgb_diff"] = round(xgb_prob - gt.min_xgb_score, 4)
-
-                if row["gate_r"] and row["gate_pvt"] and row["gate_htf"] and row["gate_combined"]:
-                    if xgb_prob > gt.min_xgb_score:
-                        row["gate_xgb"] = True
-                        row["final_status"] = "qualified"
-                    else:
-                        row["first_fail"] = row["first_fail"] or "XGBoost"
-                        row["final_status"] = "xgb_rejected"
-                        row["reject_reason"] = row["reject_reason"] or f"XGB {xgb_prob:.4f} <= {gt.min_xgb_score}"
-
-            if not row["first_fail"] and row["final_status"] != "qualified":
-                row["final_status"] = "blocked"
-
-            results.append(row)
-
-        return results
-    except Exception as e:
-        return [{"asset": "ERROR", "group": "-", "reject_reason": str(e),
-                 "final_status": "error", "best_r": 0, "pvt_r": 0, "direction": 0,
-                 "best_tf": "-", "best_period": 0, "midline": 0, "std_dev": 0,
-                 "xgb_prob": 0, "gate_r": False, "gate_pvt": False, "gate_htf": False,
-                 "gate_combined": False, "gate_xgb": False, "entry_price": 0,
-                 "r_diff": 0, "pvt_diff": 0, "xgb_diff": 0,
-                 "htf_bias_str": "-", "pvt_detail": "", "combined_detail": "",
-                 "first_fail": "", "scan_type": "5m"}]
-
-
 def _detect_live_mode() -> bool:
     """Check if the running bot has --live flag."""
     try:
@@ -736,45 +777,6 @@ def _find_best_period(close_arr: np.ndarray) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Live Ticker Bridge (Websocket)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class LiveTickerBridge:
-    """Singleton bridge to store latest ticker prices from a background thread."""
-    _instance = None
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(LiveTickerBridge, cls).__new__(cls)
-            cls._instance.prices = {}
-            cls._instance.last_update = 0
-            cls._instance._start_thread()
-        return cls._instance
-
-    def _start_thread(self):
-        import threading
-        def _run():
-            import json
-            from websocket import WebSocketApp
-            def on_message(ws, msg):
-                try:
-                    data = json.loads(msg)
-                    symbol = data["s"]
-                    price = float(data["c"])
-                    self.prices[symbol] = price
-                    self.last_update = time.time()
-                except: pass
-            
-            streams = [f"{s.lower()}@ticker" for s in ALL_ASSETS]
-            url = f"wss://fstream.binance.com/ws/{'/'.join(streams)}"
-            ws = WebSocketApp(url, on_message=on_message)
-            ws.run_forever()
-        
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-
-TICKER_BRIDGE = LiveTickerBridge()
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1: Cockpit
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -800,15 +802,10 @@ def render_cockpit(state: dict, prices: dict):
     mode_str = "LIVE" if is_live else "DRY-RUN"
     bot_status = "CB TRIPPED" if cb else ("RUNNING" if pid else "STOPPED")
 
-    # Count 5m vs HTF trades
-    n_5m_trades = sum(1 for p in positions.values() if p.get("best_tf") == "5m")
-    n_htf_trades = len(positions) - n_5m_trades
-    scan_source_str = f"5m:{n_5m_trades} HTF:{n_htf_trades}" if positions else "none"
-
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Bot Equity", f"${equity:,.2f}", f"{realized:+,.2f}")
     c2.metric("Drawdown", f"{dd:.2f}%")
-    c3.metric("Open / Max", f"{len(positions)} / 8", delta=scan_source_str, delta_color="off")
+    c3.metric("Open / Max", f"{len(positions)} / 8")
     c4.metric("Groups", grp_str)
     c5.metric("Scans", f"{state.get('total_scans', 0)}")
     if is_live:
@@ -892,10 +889,7 @@ def render_cockpit(state: dict, prices: dict):
         with st.container(border=True):
             tc1, tc2, tc3, tc4 = st.columns([1.5, 2, 2, 1.5])
             with tc1:
-                scan_origin = "WS-5m" if pos.get("best_tf") == "5m" else "Hourly"
-                origin_color = "#f6c343" if scan_origin == "WS-5m" else "#39afd1"
-                origin_badge = f'<span style="background:rgba({",".join(str(int(origin_color.lstrip("#")[i:i+2], 16)) for i in (0,2,4))},0.2);color:{origin_color};padding:1px 6px;border-radius:6px;font-size:0.7rem;">{scan_origin}</span>'
-                st.markdown(f"**{dir_emoji} {asset}** `{dir_str}` {origin_badge}", unsafe_allow_html=True)
+                st.markdown(f"**{dir_emoji} {asset}** `{dir_str}`")
                 st.markdown(f'{group_badge(group)}', unsafe_allow_html=True)
                 st.caption(f"TF: {pos['best_tf']} | P: {pos['best_period']} | Lev: {leverage}x")
             with tc2:
@@ -919,38 +913,23 @@ def render_cockpit(state: dict, prices: dict):
 
 def render_intelligence(state: dict, scan_log: dict):
     now = datetime.now(timezone.utc)
+    # Next scan is top of next hour + 60s
+    next_scan = now.replace(minute=1, second=0, microsecond=0)
+    if now.minute >= 1:
+        next_scan += timedelta(hours=1)
+    remaining = next_scan - now
+    mins = int(remaining.total_seconds()) // 60
+    secs = int(remaining.total_seconds()) % 60
 
-    # WebSocket Gear: 5-minute intervals
-    next_5m = (now + timedelta(minutes=5)).replace(second=0, microsecond=0)
-    next_5m = next_5m.replace(minute=(next_5m.minute // 5) * 5)
-    rem_5m = (next_5m - now).total_seconds()
-    m5, s5 = int(rem_5m // 60), int(rem_5m % 60)
-
-    # Hourly Gear: Audit cycle
-    next_1h = now.replace(minute=1, second=0, microsecond=0)
-    if next_1h <= now:
-        next_1h += timedelta(hours=1)
-    rem_1h = (next_1h - now).total_seconds()
-    m1h, s1h = int(rem_1h // 60), int(rem_1h % 60)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Next 5m Scan", f"{m5:02d}:{s5:02d}", delta="WS stream active")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Next Hourly Scan", f"{mins:02d}:{secs:02d}")
     c2.metric("Last Activity", time_since(state.get("last_scan_ts", "")))
-    c3.metric("Next Audit (1h)", f"{m1h:02d}:{s1h:02d}")
-    # Count 5m-originated positions
-    positions = state.get("positions", {})
-    n_5m = sum(1 for p in positions.values() if p.get("best_tf") == "5m")
-    n_other = len(positions) - n_5m
-    c4.metric("5m / HTF Trades", f"{n_5m} / {n_other}", delta=f"{len(positions)} open")
+    c3.metric("Scan Cycle #", f"{state.get('total_scans', 0)}")
+
     st.markdown("---")
 
-    # Scan mode + Group filter
-    filter_col1, filter_col2 = st.columns([1, 2])
-    with filter_col1:
-        scan_mode = st.radio("Scan Mode", ["Full (All TFs)", "5m Quick Scan"], horizontal=True,
-                             help="Full: scans 5m+30m+1h+4h (like hourly cycle). 5m Quick: scans only 5m TF (like WS inter-hour scan).")
-    with filter_col2:
-        group_filter = st.radio("Filter by Group", ["All", "A (Majors)", "B (Tech/AI)", "C (Meme)"], horizontal=True)
+    # Group filter
+    group_filter = st.radio("Filter by Group", ["All", "A (Majors)", "B (Tech/AI)", "C (Meme)"], horizontal=True)
 
     # Show group-specific thresholds
     with st.expander("Group Thresholds", expanded=False):
@@ -961,20 +940,14 @@ def render_intelligence(state: dict, scan_log: dict):
                 st.caption(f"|R| >= {gt.min_confidence} | PVT >= {gt.min_pvt_r} | XGB > {gt.min_xgb_score}")
                 st.caption(f"Combined <= {gt.combined_gate} | SL: {gt.hard_sl_mult}x | Trail: {gt.trail_buffer}")
 
-    is_5m_mode = scan_mode == "5m Quick Scan"
-    mode_label = "5m Quick Scan" if is_5m_mode else "Full (All TFs)"
-    cache_file = DASHBOARD_5M_SCAN_CACHE if is_5m_mode else DASHBOARD_SCAN_CACHE
-
-    st.subheader(f"Live Vetting — {len(ASSETS)} Coins | {mode_label}")
-    if is_5m_mode:
-        st.caption("Scanning **5m timeframe only** — mirrors the bot's inter-hour WebSocket scan (`scan_5m_asset`)")
+    st.subheader(f"Live Vetting — {len(ASSETS)} Coins vs Group Thresholds")
 
     # Load cached scan or run new one on button click
     scan_results = None
     cached_ts = ""
-    if cache_file.exists():
+    if DASHBOARD_SCAN_CACHE.exists():
         try:
-            cache = json.loads(cache_file.read_text())
+            cache = json.loads(DASHBOARD_SCAN_CACHE.read_text())
             scan_results = cache.get("results", [])
             cached_ts = cache.get("timestamp", "")
         except Exception:
@@ -982,32 +955,29 @@ def render_intelligence(state: dict, scan_log: dict):
 
     btn_col, info_col = st.columns([1, 3])
     with btn_col:
-        btn_label = "5m Scan Now" if is_5m_mode else "Full Scan Now"
-        do_scan = st.button(btn_label, type="primary", use_container_width=True)
+        do_scan = st.button("Scan Now", type="primary", use_container_width=True)
     with info_col:
         if cached_ts:
-            st.caption(f"Last {mode_label} scan: {cached_ts}")
+            st.caption(f"Last dashboard scan: {cached_ts}")
         else:
-            st.caption(f"No cached {mode_label} scan — click **{btn_label}** to run")
+            st.caption("No cached scan — click **Scan Now** to run")
 
     if do_scan:
-        spinner_msg = f"5m scanning {len(ASSETS)} assets through 5 gates..." if is_5m_mode else f"Full scanning {len(ASSETS)} assets through 5 gates..."
-        with st.spinner(spinner_msg):
-            scan_results = run_dashboard_5m_scan() if is_5m_mode else run_dashboard_scan()
+        with st.spinner(f"Scanning {len(ASSETS)} assets through 5 gates..."):
+            scan_results = run_dashboard_scan()
         if scan_results and not (len(scan_results) == 1 and scan_results[0].get("asset") == "ERROR"):
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            DASHBOARD_SCAN_CACHE.parent.mkdir(parents=True, exist_ok=True)
             cache_data = {
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "scan_mode": "5m" if is_5m_mode else "full",
                 "results": scan_results,
             }
-            cache_file.write_text(json.dumps(cache_data, indent=2))
+            DASHBOARD_SCAN_CACHE.write_text(json.dumps(cache_data, indent=2))
 
     if not scan_results or (len(scan_results) == 1 and scan_results[0].get("asset") == "ERROR"):
         if scan_results:
             st.error(f"Scan error: {scan_results[0].get('reject_reason', 'Unknown')}")
         else:
-            st.info(f"Click **{btn_label}** to run a {'5m-only' if is_5m_mode else 'full'} live scan of all 33 assets.")
+            st.info("Click **Scan Now** to run a live scan of all 33 assets.")
         _render_bot_scan_log(scan_log)
         return
 
@@ -1202,144 +1172,62 @@ def render_intelligence(state: dict, scan_log: dict):
                     st.markdown(gates_html, unsafe_allow_html=True)
 
     st.markdown("---")
-    # _render_bot_scan_log(scan_log) - Removed duplicate
-    return
+    _render_bot_scan_log(scan_log)
+
 
 def _render_bot_scan_log(scan_log: dict):
-    st.subheader("Bot Activity Log")
+    with st.expander("Bot's Last Scan Log", expanded=False):
+        signals = scan_log.get("signals", [])
+        ts = scan_log.get("timestamp", "")
+        scan_num = scan_log.get("scan_number", 0)
+        if ts:
+            st.caption(f"Bot scan #{scan_num} at: {ts}")
+        if signals:
+            STATUS_COLORS = {
+                "entered": "#00d97e", "xgb_rejected": "#f6c343",
+                "physics_rejected": "#e63757", "in_position": "#39afd1",
+                "just_closed": "#888", "no_data": "#555", "max_positions": "#888",
+            }
+            rows_html = ""
+            for s in signals:
+                status = s.get("status", "?")
+                color = STATUS_COLORS.get(status, "#888")
+                asset = s.get("asset", "?")
+                group = s.get("group", ASSET_TO_GROUP.get(asset, "?"))
+                detail_parts = []
+                if s.get("direction"):
+                    detail_parts.append("LONG" if s["direction"] == 1 else "SHORT")
+                if s.get("confidence"):
+                    detail_parts.append(f"|R|={s['confidence']:.4f}")
+                if s.get("xgb_prob"):
+                    detail_parts.append(f"XGB={s['xgb_prob']:.4f}")
+                if s.get("tf"):
+                    detail_parts.append(f"{s['tf']}/{s.get('period','')}")
+                detail = " | ".join(detail_parts)
+                grp_color = GROUP_COLORS.get(group, "#888")
+                rows_html += (
+                    f'<tr style="border-bottom:1px solid #1e2235;">'
+                    f'<td style="padding:4px 6px;"><b>{asset}</b></td>'
+                    f'<td style="padding:4px 6px;color:{grp_color}">{group}</td>'
+                    f'<td style="padding:4px 6px;color:{color}">{status}</td>'
+                    f'<td style="padding:4px 6px;color:#aaa;font-size:0.85em">{detail}</td>'
+                    f'</tr>'
+                )
+            table = (
+                '<table style="width:100%;border-collapse:collapse;font-size:0.85rem;">'
+                '<thead><tr style="border-bottom:2px solid #333;color:#8b92a5;">'
+                '<th style="text-align:left;padding:4px 6px;">Coin</th>'
+                '<th style="text-align:left;padding:4px 6px;">Grp</th>'
+                '<th style="text-align:left;padding:4px 6px;">Status</th>'
+                '<th style="text-align:left;padding:4px 6px;">Details</th>'
+                '</tr></thead><tbody>' + rows_html + '</tbody></table>'
+            )
+            st.markdown(table, unsafe_allow_html=True)
+        else:
+            st.caption("No scan data recorded yet.")
 
-    # Bot status check
-    bot_state = load_bot_state()
-    pid = get_bot_pid()
-    current_asset = bot_state.get("current_scanning_asset", "")
-    last_scan = bot_state.get("last_scan_ts", "")
-    total_scans = bot_state.get("total_scans", 0)
-
-    # Status bar
-    if pid:
-        st.success(f"Bot is **RUNNING** (PID: {pid}) | Scans: {total_scans} | Last: {time_since(last_scan)}")
-    else:
-        st.warning(f"Bot is **STOPPED** | Last scan: {time_since(last_scan)} | Total scans: {total_scans}")
-
-    # We maintain a persistent view of all 33 assets
-    # Using session_state to keep history between fragment refreshes
-    if "asset_log_state" not in st.session_state:
-        st.session_state.asset_log_state = {a: {"status": "IDLE", "r": 0.0, "pvt": 0.0, "xgb": 0.0, "detail": "", "scan_type": "-"} for a in ALL_ASSETS}
-
-    # Update state with latest scan_log data
-    signals = scan_log.get("signals", [])
-    ts = scan_log.get("timestamp", "")
-    is_ws_scan = "WS-5m" in ts if ts else False
-
-    for s in signals:
-        asset = s.get("asset")
-        if asset in st.session_state.asset_log_state:
-            scan_type = "WS-5m" if (is_ws_scan or s.get("tf") == "5m") else "Hourly"
-            st.session_state.asset_log_state[asset].update({
-                "status": s.get("status", "IDLE").upper(),
-                "r": s.get("confidence", 0.0),
-                "pvt": s.get("pvt_r", 0.0),
-                "xgb": s.get("xgb_prob", 0.0),
-                "detail": s.get("detail", ""),
-                "scan_type": scan_type,
-            })
-
-    # Also populate from trade history for assets that have traded
-    if TRADES_FILE.exists():
-        try:
-            tdf = pd.read_csv(TRADES_FILE)
-            for _, t in tdf.iterrows():
-                a = t.get("asset", "")
-                if a in st.session_state.asset_log_state:
-                    existing = st.session_state.asset_log_state[a]
-                    if existing["status"] == "IDLE":
-                        pnl = t.get("pnl_pct", 0)
-                        result = "WIN" if pnl > 0 else "LOSS"
-                        scan_t = "WS-5m" if t.get("best_tf") == "5m" else "Hourly"
-                        st.session_state.asset_log_state[a].update({
-                            "status": f"LAST: {result} ({pnl:+.1f}%)",
-                            "r": t.get("confidence", 0.0),
-                            "pvt": t.get("pvt_r", 0.0),
-                            "xgb": 0.0,
-                            "detail": f"{t.get('exit_reason', '')} | {t.get('best_tf', '')}",
-                            "scan_type": scan_t,
-                        })
-        except Exception:
-            pass
-
-    # Mark open positions
-    positions = bot_state.get("positions", {})
-    for asset, pos in positions.items():
-        if asset in st.session_state.asset_log_state:
-            scan_t = "WS-5m" if pos.get("best_tf") == "5m" else "Hourly"
-            st.session_state.asset_log_state[asset].update({
-                "status": "OPEN",
-                "r": pos.get("confidence", 0.0),
-                "pvt": pos.get("pvt_r", 0.0),
-                "xgb": pos.get("xgb_prob", 0.0),
-                "detail": f"{'LONG' if pos.get('direction') == 1 else 'SHORT'} | {pos.get('best_tf', '')}",
-                "scan_type": scan_t,
-            })
-
-    if ts:
-        st.caption(f"Last Scan Event: **{ts}**" + (f" | Currently Scanning: **{current_asset}**" if current_asset else ""))
-
-    data = []
-    for asset in ALL_ASSETS:
-        state = st.session_state.asset_log_state[asset]
-        status = state["status"]
-        if asset == current_asset:
-            status = "SCANNING"
-
-        data.append({
-            "Asset": asset,
-            "Group": get_group(asset),
-            "Scan": state.get("scan_type", "-"),
-            "Status": status,
-            "Pearson R": state["r"],
-            "PVT R": state["pvt"],
-            "XGB": state["xgb"],
-            "Detail": state["detail"]
-        })
-
-    df = pd.DataFrame(data)
-
-    def style_bot_log(row):
-        group = row["Group"]
-        gt = GROUP_THRESHOLDS.get(group, DEFAULT_THRESHOLDS.get(group))
-
-        # Scan type color
-        scan_color = "color: #f6c343" if row["Scan"] == "WS-5m" else ("color: #39afd1" if row["Scan"] == "Hourly" else "color: #555")
-
-        # Status colors
-        status_color = "#555"
-        if "ENTERED" in row["Status"] or "OPEN" in row["Status"]: status_color = "#00d97e; font-weight: bold"
-        elif "WIN" in row["Status"]: status_color = "#00d97e"
-        elif "LOSS" in row["Status"]: status_color = "#e63757"
-        elif "REJECTED" in row["Status"] or "CONFLICT" in row["Status"]: status_color = "#e63757"
-        elif "SCANNING" in row["Status"]: status_color = "#39afd1; font-weight: bold"
-
-        # Threshold-based colors
-        r_color = "color: #e63757" if row["Pearson R"] > 0 and row["Pearson R"] < gt.min_confidence else "color: #00d97e"
-        if row["Pearson R"] == 0: r_color = "color: #444"
-
-        pvt_color = "color: #e63757" if row["PVT R"] > 0 and row["PVT R"] < gt.min_pvt_r else "color: #00d97e"
-        if row["PVT R"] == 0: pvt_color = "color: #444"
-
-        xgb_color = "color: #e63757" if row["XGB"] > 0 and row["XGB"] < gt.min_xgb_score else "color: #00d97e"
-        if row["XGB"] == 0: xgb_color = "color: #444"
-
-        return ["", "", scan_color, f"color: {status_color}", r_color, pvt_color, xgb_color, ""]
-
-    st.dataframe(
-        df.style.apply(style_bot_log, axis=1),
-        use_container_width=True,
-        hide_index=True,
-        height=600,
-    )
-
-    with st.expander("Bot Log (last 50 lines)", expanded=False):
-        log_lines = parse_recent_logs(50)
+    with st.expander("Bot Log (last 30 lines)", expanded=False):
+        log_lines = parse_recent_logs(30)
         if log_lines:
             st.code("\n".join(log_lines), language="log")
         else:
@@ -1351,12 +1239,15 @@ def _render_bot_scan_log(scan_log: dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render_charting(state: dict, trades_df: pd.DataFrame):
-    # Live Ticker Integration
+    st.caption("Live Percentile Indicator — Rolling XGB/R overlay with P-Matrix zone coloring. Exit via Statistical Exhaustion (P-Floor) or 1.5% Hard SL.")
+
     positions = state.get("positions", {})
+    distributions = _build_percentile_distributions()
     open_assets = list(positions.keys())
     other_assets = [a for a in ASSETS if a not in open_assets]
     asset_list = open_assets + other_assets
 
+    # TF auto-select: lock to position's TF when viewing an open asset
     col_sel, col_tf, col_grp = st.columns([2, 1, 1])
     with col_sel:
         selected_asset = st.selectbox(
@@ -1364,18 +1255,19 @@ def render_charting(state: dict, trades_df: pd.DataFrame):
             asset_list,
             format_func=lambda a: f"{a} [{get_group(a)}] {'(OPEN)' if a in positions else ''}",
         )
-    
-    # Get Live Price from WebSocket Bridge
-    ws_price = TICKER_BRIDGE.prices.get(f"{selected_asset}USDT", 0)
-    
+    default_tf_idx = 2  # 1h
+    if selected_asset and selected_asset in positions:
+        pos_tf = positions[selected_asset].get("best_tf", "1h")
+        if pos_tf in SCAN_TIMEFRAMES:
+            default_tf_idx = SCAN_TIMEFRAMES.index(pos_tf)
     with col_tf:
-        selected_tf = st.selectbox("Timeframe", SCAN_TIMEFRAMES, index=2)
+        selected_tf = st.selectbox("Timeframe", SCAN_TIMEFRAMES, index=default_tf_idx)
     with col_grp:
         if selected_asset:
-            if ws_price > 0:
-                st.markdown(f"**Live Price: `${ws_price:.4f}`** :signal_strength:")
-            else:
-                st.markdown(f"**Group {get_group(selected_asset)}**")
+            g = get_group(selected_asset)
+            m = TF_MATRIX.get(selected_tf, TF_MATRIX["4h"])
+            st.markdown(f"**Group {g}** — {GROUP_LABELS.get(g, '')}")
+            st.caption(f"{selected_tf}: {m['leverage']}x | Entry P{m['entry_p']*100:.0f} | Exit P{m['exit_p']*100:.0f}")
 
     if not selected_asset:
         return
@@ -1388,14 +1280,6 @@ def render_charting(state: dict, trades_df: pd.DataFrame):
         st.error(f"Failed to fetch candle data for {symbol}")
         return
 
-    # Update latest candle with WebSocket price for real-time feel
-    if ws_price > 0:
-        df_candles.iloc[-1, df_candles.columns.get_loc("close")] = ws_price
-        if ws_price > df_candles.iloc[-1]["high"]:
-            df_candles.iloc[-1, df_candles.columns.get_loc("high")] = ws_price
-        if ws_price < df_candles.iloc[-1]["low"]:
-            df_candles.iloc[-1, df_candles.columns.get_loc("low")] = ws_price
-
     close_arr = df_candles["close"].values.astype(np.float64)
 
     if selected_asset in positions:
@@ -1405,69 +1289,121 @@ def render_charting(state: dict, trades_df: pd.DataFrame):
 
     channel = compute_regression_channel(close_arr, chart_period)
 
-    # XGBoost sentiment
-    xgb_prob = 0.0
+    # P-Matrix thresholds for selected TF
+    tf_matrix = TF_MATRIX.get(selected_tf, TF_MATRIX["4h"])
+    entry_threshold = _get_pmatrix_threshold(distributions, selected_tf, tf_matrix["entry_p"])
+    exit_threshold = _get_pmatrix_threshold(distributions, selected_tf, tf_matrix["exit_p"])
+    p50_threshold = _get_pmatrix_threshold(distributions, selected_tf, 0.50)
+
+    # ── Rolling XGB/R computation per candle ──
+    rolling_xgb = []
+    rolling_r = []
+    rolling_pvt_r = []
+    rolling_ts = []
+    rolling_pct = []
+    rolling_status = []
     xgb_direction = 0
-    group = get_group(selected_asset)
-    gt = GROUP_THRESHOLDS.get(group, GroupThresholds())
+
     try:
         from neo_flow.adaptive_engine import calc_log_regression, compute_pvt, calc_linear_regression
         from ml.train_meta_model import predict_probability, load_model
 
-        std_dev, pearson_r, slope, intercept = calc_log_regression(close_arr, chart_period)
-        direction = 1 if slope < 0 else -1
-        xgb_direction = direction
-
-        pvt_r_val = 0.0
-        if len(df_candles) >= chart_period:
-            pvt_arr = compute_pvt(df_candles.iloc[-chart_period:])
-            _, pvt_r, _, _ = calc_linear_regression(pvt_arr, min(chart_period, len(pvt_arr)))
-            pvt_r_val = abs(pvt_r)
-
+        xgb_model = None
         xgb_path = BASE_DIR / "models" / "meta_xgb.json"
         if xgb_path.exists():
-            model, _ = load_model(xgb_path)
-            xgb_prob = predict_probability(
-                model, confidence=abs(pearson_r), pvt_r=pvt_r_val,
-                best_tf=selected_tf, best_period=chart_period, pnl_pct=0.0,
-            )
+            xgb_model, _ = load_model(xgb_path)
+
+        if xgb_model is not None and len(df_candles) >= chart_period:
+            for i in range(chart_period, len(df_candles) + 1):
+                window_close = close_arr[i - chart_period:i]
+                try:
+                    std_dev, pearson_r, slope, intercept = calc_log_regression(window_close, chart_period)
+                    r_abs = abs(pearson_r)
+                    window_df = df_candles.iloc[i - chart_period:i]
+                    pvt_arr = compute_pvt(window_df)
+                    _, pvt_r, _, _ = calc_linear_regression(pvt_arr, min(chart_period, len(pvt_arr)))
+                    pvt_r_abs = abs(pvt_r)
+
+                    xgb_score = predict_probability(
+                        xgb_model, confidence=r_abs, pvt_r=pvt_r_abs,
+                        best_tf=selected_tf, best_period=chart_period,
+                    )
+
+                    p_val = _score_to_percentile(distributions, selected_tf, xgb_score)
+
+                    if xgb_score >= p50_threshold:
+                        status = "STRONG"
+                    elif xgb_score >= exit_threshold:
+                        status = "ACTIVE"
+                    else:
+                        status = "EXHAUSTED"
+
+                    rolling_xgb.append(xgb_score)
+                    rolling_r.append(r_abs)
+                    rolling_pvt_r.append(pvt_r_abs)
+                    rolling_ts.append(df_candles.index[i - 1])
+                    rolling_pct.append(p_val)
+                    rolling_status.append(status)
+                except Exception:
+                    rolling_xgb.append(np.nan)
+                    rolling_r.append(np.nan)
+                    rolling_pvt_r.append(np.nan)
+                    rolling_ts.append(df_candles.index[i - 1])
+                    rolling_pct.append(0.0)
+                    rolling_status.append("DATA_LAG")
+
+            # Direction from latest regression slope
+            if channel is not None:
+                xgb_direction = 1 if channel["slope"] < 0 else -1
     except Exception:
         pass
 
-    # Build chart
+    # Current values (latest point in rolling series)
+    xgb_prob = rolling_xgb[-1] if rolling_xgb and not np.isnan(rolling_xgb[-1]) else 0.0
+    pearson_r_val = rolling_r[-1] if rolling_r and not np.isnan(rolling_r[-1]) else 0.0
+    pvt_r_val = rolling_pvt_r[-1] if rolling_pvt_r and not np.isnan(rolling_pvt_r[-1]) else 0.0
+    p_value = rolling_pct[-1] if rolling_pct else 0.0
+
+    # ── Build dual-axis chart: Price + XGB/R overlay ──
     fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True,
-        row_heights=[0.65, 0.20, 0.15], vertical_spacing=0.03,
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.82, 0.18], vertical_spacing=0.03,
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
     )
 
     timestamps = df_candles.index
 
+    # Candlestick (primary Y)
     fig.add_trace(go.Candlestick(
         x=timestamps, open=df_candles["open"], high=df_candles["high"],
         low=df_candles["low"], close=df_candles["close"], name="Price",
         increasing_line_color="#00d97e", decreasing_line_color="#e63757",
         increasing_fillcolor="#00d97e", decreasing_fillcolor="#e63757",
-    ), row=1, col=1)
+    ), row=1, col=1, secondary_y=False)
 
+    # Regression channel (primary Y)
     if channel is not None:
         period = channel["period"]
         ch_timestamps = timestamps[-period:]
         fig.add_trace(go.Scatter(x=ch_timestamps, y=channel["upper"], mode="lines",
-            name="Upper (+1s)", line=dict(color="rgba(249,115,22,0.5)", width=1, dash="dot")), row=1, col=1)
+            name="Upper (+1\u03c3)", line=dict(color="rgba(249,115,22,0.5)", width=1, dash="dot")),
+            row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=ch_timestamps, y=channel["midline"], mode="lines",
-            name="Midline", line=dict(color="#f59e0b", width=2)), row=1, col=1)
+            name="Midline", line=dict(color="#f59e0b", width=2)),
+            row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=ch_timestamps, y=channel["lower"], mode="lines",
-            name="Lower (-1s)", line=dict(color="rgba(249,115,22,0.5)", width=1, dash="dot")), row=1, col=1)
+            name="Lower (-1\u03c3)", line=dict(color="rgba(249,115,22,0.5)", width=1, dash="dot")),
+            row=1, col=1, secondary_y=False)
 
+    # Open position overlays (primary Y)
     if selected_asset in positions:
         pos = positions[selected_asset]
-        fig.add_hline(y=pos["trail_sl"], line_dash="dash", line_color="#f6c343",
-            annotation_text=f"Trail SL: {pos['trail_sl']:.6f}", annotation_font_color="#f6c343", row=1, col=1)
-        fig.add_hline(y=pos["hard_sl"], line_dash="dash", line_color="#e63757",
-            annotation_text=f"Hard SL: {pos['hard_sl']:.6f}", annotation_font_color="#e63757", row=1, col=1)
         fig.add_hline(y=pos["entry_price"], line_dash="dot", line_color="#39afd1",
             annotation_text=f"Entry: {pos['entry_price']:.6f}", annotation_font_color="#39afd1", row=1, col=1)
+        fig.add_hline(y=pos["hard_sl"], line_dash="dash", line_color="#e63757",
+            annotation_text=f"Hard SL 1.5%: {pos['hard_sl']:.6f}", annotation_font_color="#e63757", row=1, col=1)
 
+    # Historical trade markers (primary Y)
     if not trades_df.empty:
         asset_trades = trades_df[trades_df["asset"] == selected_asset].copy()
         if not asset_trades.empty:
@@ -1476,45 +1412,171 @@ def render_charting(state: dict, trades_df: pd.DataFrame):
                 marker_sym = "triangle-up" if t.get("direction") in [1, "LONG"] else "triangle-down"
                 fig.add_trace(go.Scatter(x=[t["entry_ts"]], y=[t["entry_price"]], mode="markers",
                     marker=dict(symbol=marker_sym, size=14, color=color, line=dict(width=1, color="white")),
-                    showlegend=False, hovertemplate=f"ENTRY {t['entry_price']:.6f}<extra></extra>"), row=1, col=1)
+                    showlegend=False, hovertemplate=f"ENTRY {t['entry_price']:.6f}<extra></extra>"),
+                    row=1, col=1, secondary_y=False)
             for _, t in asset_trades.iterrows():
                 pnl = t.get("pnl_pct", 0)
+                exit_reason = t.get("exit_reason", "")
                 color = "#00d97e" if pnl > 0 else "#e63757"
+                marker_sym = "star" if exit_reason == "P_FLOOR_EXIT" else "x"
                 fig.add_trace(go.Scatter(x=[t["exit_ts"]], y=[t["exit_price"]], mode="markers",
-                    marker=dict(symbol="x", size=12, color=color, line=dict(width=2, color=color)),
-                    showlegend=False, hovertemplate=f"EXIT {t['exit_price']:.6f} ({pnl:+.2f}%)<extra></extra>"), row=1, col=1)
+                    marker=dict(symbol=marker_sym, size=12, color=color, line=dict(width=2, color=color)),
+                    showlegend=False,
+                    hovertemplate=f"EXIT {t['exit_price']:.6f} ({pnl:+.2f}%)<br>{exit_reason}<extra></extra>"),
+                    row=1, col=1, secondary_y=False)
 
+    # ── XGB Indicator Line (secondary Y, color-segmented by P-Matrix zones) ──
+    if rolling_xgb and rolling_ts:
+        # Build color-segmented line: Green >P50, Yellow P-Exit..P50, Red <P-Exit
+        segments = []
+        seg_x, seg_y, seg_hover = [], [], []
+        current_color = None
+
+        for idx in range(len(rolling_xgb)):
+            ts = rolling_ts[idx]
+            xval = rolling_xgb[idx]
+            rval = rolling_r[idx]
+            pval = rolling_pct[idx]
+            sval = rolling_status[idx]
+
+            # DATA_LAG gap — break the line
+            if np.isnan(xval):
+                if seg_x:
+                    segments.append((current_color, seg_x[:], seg_y[:], seg_hover[:]))
+                    seg_x, seg_y, seg_hover = [], [], []
+                    current_color = None
+                continue
+
+            if xval >= p50_threshold:
+                color = "#10b981"  # green — strong
+            elif xval >= exit_threshold:
+                color = "#fbbf24"  # yellow — active
+            else:
+                color = "#ef4444"  # red — exhausted
+
+            r_disp = f"{rval:.4f}" if not np.isnan(rval) else "N/A"
+            hover = (f"XGB: {xval:.4f}  |  |R|: {r_disp}<br>"
+                     f"Percentile: P{min(pval, 100):.0f}  |  Status: {sval}")
+
+            if color != current_color and seg_x:
+                # Overlap last point into new segment for line continuity
+                segments.append((current_color, seg_x[:], seg_y[:], seg_hover[:]))
+                seg_x = [seg_x[-1]]
+                seg_y = [seg_y[-1]]
+                seg_hover = [seg_hover[-1]]
+                current_color = color
+            elif current_color is None:
+                current_color = color
+
+            seg_x.append(ts)
+            seg_y.append(xval)
+            seg_hover.append(hover)
+
+        if seg_x:
+            segments.append((current_color, seg_x, seg_y, seg_hover))
+
+        # Draw segments on secondary Y
+        first_seg = True
+        for seg_color, sx, sy, sh in segments:
+            fig.add_trace(go.Scatter(
+                x=sx, y=sy, mode="lines+markers",
+                line=dict(color=seg_color, width=2.5),
+                marker=dict(size=3, color=seg_color),
+                name="XGB Score" if first_seg else None,
+                showlegend=first_seg,
+                text=sh, hoverinfo="text",
+                connectgaps=False,
+            ), row=1, col=1, secondary_y=True)
+            first_seg = False
+
+        # DATA_LAG grey markers for NaN gaps
+        lag_ts = [rolling_ts[i] for i in range(len(rolling_xgb)) if np.isnan(rolling_xgb[i])]
+        if lag_ts:
+            fig.add_trace(go.Scatter(
+                x=lag_ts, y=[0.5] * len(lag_ts), mode="markers",
+                marker=dict(size=6, color="rgba(100,116,139,0.6)", symbol="diamond"),
+                name="DATA_LAG", showlegend=True,
+                hovertext=["DATA_LAG — Missing signal data"] * len(lag_ts),
+                hoverinfo="text",
+            ), row=1, col=1, secondary_y=True)
+
+        # Pearson |R| line (thin dashed, secondary Y)
+        valid_r_ts = [rolling_ts[i] for i in range(len(rolling_r)) if not np.isnan(rolling_r[i])]
+        valid_r_vals = [rolling_r[i] for i in range(len(rolling_r)) if not np.isnan(rolling_r[i])]
+        if valid_r_ts:
+            fig.add_trace(go.Scatter(
+                x=valid_r_ts, y=valid_r_vals, mode="lines",
+                line=dict(color="rgba(148,163,184,0.5)", width=1.5, dash="dot"),
+                name="Pearson |R|", showlegend=True,
+                hoverinfo="skip",
+            ), row=1, col=1, secondary_y=True)
+
+        # P-Matrix threshold reference lines on secondary Y
+        x_range = [rolling_ts[0], rolling_ts[-1]]
+
+        # Entry barrier (green dashed)
+        fig.add_trace(go.Scatter(
+            x=x_range, y=[entry_threshold, entry_threshold], mode="lines",
+            line=dict(color="rgba(16,185,129,0.6)", width=1.5, dash="dash"),
+            name=f"Entry P{tf_matrix['entry_p']*100:.0f}: {entry_threshold:.4f}",
+            showlegend=True, hoverinfo="skip",
+        ), row=1, col=1, secondary_y=True)
+
+        # Exit floor (red dashed)
+        fig.add_trace(go.Scatter(
+            x=x_range, y=[exit_threshold, exit_threshold], mode="lines",
+            line=dict(color="rgba(239,68,68,0.6)", width=1.5, dash="dash"),
+            name=f"P-Floor P{tf_matrix['exit_p']*100:.0f}: {exit_threshold:.4f}",
+            showlegend=True, hoverinfo="skip",
+        ), row=1, col=1, secondary_y=True)
+
+        # P50 midline (yellow dotted)
+        fig.add_trace(go.Scatter(
+            x=x_range, y=[p50_threshold, p50_threshold], mode="lines",
+            line=dict(color="rgba(251,191,36,0.35)", width=1, dash="dot"),
+            name=f"P50: {p50_threshold:.4f}",
+            showlegend=True, hoverinfo="skip",
+        ), row=1, col=1, secondary_y=True)
+
+    # Volume (row 2)
     vol_colors = ["#00d97e" if c >= o else "#e63757" for c, o in zip(df_candles["close"], df_candles["open"])]
     fig.add_trace(go.Bar(x=timestamps, y=df_candles["volume"], name="Volume",
         marker_color=vol_colors, opacity=0.5, showlegend=False), row=2, col=1)
 
-    sentiment_label = "BULLISH" if xgb_direction == 1 else "BEARISH" if xgb_direction == -1 else "NEUTRAL"
-    sent_color = f"rgba(0,217,126,{min(xgb_prob, 1.0):.2f})" if xgb_direction == 1 else f"rgba(230,55,87,{min(xgb_prob, 1.0):.2f})" if xgb_prob > 0 else "rgba(100,100,100,0.3)"
-    fig.add_trace(go.Bar(x=timestamps[-50:], y=[xgb_prob] * min(50, len(timestamps)),
-        name=f"XGB: {xgb_prob:.3f} ({sentiment_label})", marker_color=sent_color, showlegend=True), row=3, col=1)
-    fig.add_hline(y=gt.min_xgb_score, line_dash="dash", line_color="#555",
-        annotation_text=f"Threshold: {gt.min_xgb_score}", row=3, col=1)
-
+    # Layout
     fig.update_layout(
-        template="plotly_dark", height=750,
+        template="plotly_dark", height=800,
         paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-        margin=dict(l=60, r=20, t=40, b=30),
+        margin=dict(l=60, r=60, t=40, b=30),
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+                    font=dict(size=10)),
     )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="XGB / |R|", row=1, col=1, secondary_y=True,
+                     range=[0, 1.05], showgrid=False,
+                     tickformat=".2f", tickvals=[0, 0.25, 0.5, 0.75, 1.0])
     fig.update_yaxes(title_text="Vol", row=2, col=1)
-    fig.update_yaxes(title_text="XGB", row=3, col=1, range=[0, 1])
 
     st.plotly_chart(fig, use_container_width=True)
 
-    if channel is not None:
-        ic1, ic2, ic3, ic4, ic5 = st.columns(5)
-        ic1.metric("Pearson |R|", f"{abs(channel['pearson_r']):.4f}")
-        ic2.metric("Period", f"{channel['period']}")
-        ic3.metric("Midline", f"{channel['midline'][-1]:.6f}")
-        ic4.metric("XGB Prob", f"{xgb_prob:.4f}")
-        ic5.metric("Sentiment", sentiment_label)
+    # Metrics row — P-Matrix focused
+    sentiment_label = "BULLISH" if xgb_direction == 1 else "BEARISH" if xgb_direction == -1 else "NEUTRAL"
+    ic1, ic2, ic3, ic4, ic5, ic6 = st.columns(6)
+    ic1.metric("Pearson |R|", f"{pearson_r_val:.4f}")
+    ic2.metric("PVT |R|", f"{pvt_r_val:.4f}")
+    ic3.metric("XGB Score", f"{xgb_prob:.4f}")
+    ic4.metric("P-Value", f"P{p_value:.0f}")
+    ic5.metric("Leverage", f"{tf_matrix['leverage']}x")
+    if xgb_prob <= 0:
+        health = "N/A"
+    elif xgb_prob < exit_threshold:
+        health = "EXHAUSTED"
+    elif xgb_prob < entry_threshold:
+        health = "ACTIVE"
+    else:
+        health = "STRONG"
+    ic6.metric("Signal", f"{sentiment_label} ({health})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1589,44 +1651,6 @@ def render_analytics(state: dict, trades_df: pd.DataFrame, wfv: dict):
     sc3.metric("Total PnL", f"${total_pnl:+,.2f}")
     sc4.metric("Profit Factor", f"{pf:.2f}")
     sc5.metric("Max DD", f"{max_dd:.2f}%")
-
-    # 5m vs HTF breakdown
-    if "best_tf" in df.columns:
-        st.markdown("---")
-        st.subheader("Scan Origin: 5m (WS) vs HTF (Hourly)")
-        df_5m = df[df["best_tf"] == "5m"]
-        df_htf = df[df["best_tf"] != "5m"]
-
-        oc1, oc2 = st.columns(2)
-        with oc1:
-            st.markdown("**5m WS Trades** (inter-hour WebSocket scan)")
-            if len(df_5m) > 0:
-                w5 = (df_5m["pnl_usd"] > 0).sum()
-                wr5 = w5 / len(df_5m) * 100
-                pnl5 = df_5m["pnl_usd"].sum()
-                avg5 = df_5m["pnl_pct"].mean()
-                m5a, m5b, m5c, m5d = st.columns(4)
-                m5a.metric("Trades", f"{len(df_5m)}")
-                m5b.metric("Win Rate", f"{wr5:.1f}%")
-                m5c.metric("PnL", f"${pnl5:+,.2f}")
-                m5d.metric("Avg PnL%", f"{avg5:+.2f}%")
-            else:
-                st.caption("No 5m trades yet")
-
-        with oc2:
-            st.markdown("**HTF Trades** (hourly full-TF scan)")
-            if len(df_htf) > 0:
-                wh = (df_htf["pnl_usd"] > 0).sum()
-                wrh = wh / len(df_htf) * 100
-                pnlh = df_htf["pnl_usd"].sum()
-                avgh = df_htf["pnl_pct"].mean()
-                mha, mhb, mhc, mhd = st.columns(4)
-                mha.metric("Trades", f"{len(df_htf)}")
-                mhb.metric("Win Rate", f"{wrh:.1f}%")
-                mhc.metric("PnL", f"${pnlh:+,.2f}")
-                mhd.metric("Avg PnL%", f"{avgh:+.2f}%")
-            else:
-                st.caption("No HTF trades yet")
 
     # Distribution charts
     st.markdown("---")
@@ -1705,7 +1729,7 @@ def render_trade_history(trades_df: pd.DataFrame):
 
     # ── Filters ───────────────────────────────────────────────────────
     st.subheader("Trade History")
-    fc1, fc2, fc3, fc4, fc5, fc6 = st.columns(6)
+    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
 
     with fc1:
         groups = sorted(df["group"].unique().tolist()) if "group" in df.columns else []
@@ -1723,8 +1747,6 @@ def render_trade_history(trades_df: pd.DataFrame):
         sel_exits = st.multiselect("Exit Reason", exit_reasons, default=exit_reasons, key="th_exits")
     with fc5:
         outcome = st.selectbox("Outcome", ["All", "Winners", "Losers"], key="th_outcome")
-    with fc6:
-        scan_source = st.selectbox("Scan Source", ["All", "5m (WS)", "HTF (Hourly)"], key="th_scan_src")
 
     # Apply filters
     sel_dir_vals = [dir_map.get(d, d) for d in sel_dirs]
@@ -1743,13 +1765,6 @@ def render_trade_history(trades_df: pd.DataFrame):
         df = df[df["pnl_pct"] > 0]
     elif outcome == "Losers":
         df = df[df["pnl_pct"] <= 0]
-
-    # Scan source filter (5m WS vs HTF hourly)
-    if "best_tf" in df.columns:
-        if scan_source == "5m (WS)":
-            df = df[df["best_tf"] == "5m"]
-        elif scan_source == "HTF (Hourly)":
-            df = df[df["best_tf"] != "5m"]
 
     if df.empty:
         st.warning("No trades match the selected filters.")
@@ -1869,16 +1884,12 @@ def render_trade_history(trades_df: pd.DataFrame):
     st.subheader("All Trades")
 
     display_cols = [
-        "trade_id", "asset", "group", "scan_source", "direction", "entry_ts", "exit_ts",
+        "trade_id", "asset", "group", "direction", "entry_ts", "exit_ts",
         "entry_price", "exit_price", "best_tf", "confidence", "pvt_r",
         "leverage", "exit_reason", "duration_hours", "pnl_pct", "pnl_usd",
     ]
-    display_df = df.copy()
-    # Add scan source column
-    if "best_tf" in display_df.columns:
-        display_df["scan_source"] = display_df["best_tf"].apply(lambda tf: "WS-5m" if tf == "5m" else "Hourly")
-    cols_present = [c for c in display_cols if c in display_df.columns]
-    display_df = display_df[cols_present].sort_values("exit_ts", ascending=False).copy()
+    cols_present = [c for c in display_cols if c in df.columns]
+    display_df = df[cols_present].sort_values("exit_ts", ascending=False).copy()
 
     if "direction" in display_df.columns:
         display_df["direction"] = display_df["direction"].apply(
@@ -1979,7 +1990,7 @@ def render_controls(state: dict):
         if get_bot_pid():
             st.warning("Bot is already running. Stop it first.")
         else:
-            cmd = f"nohup python3 {BASE_DIR / 'live_extended_bot.py'} --capital {capital}"
+            cmd = f"nohup python3 {BASE_DIR / 'live_extended_v1.py'} --capital {capital}"
             if mode == "Live":
                 cmd += " --live"
             cmd += f" > {BASE_DIR / 'logs' / 'bot_stdout.log'} 2>&1 &"
@@ -2011,14 +2022,300 @@ def render_controls(state: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Signal Health Monitor Tab
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _render_health_gauge(asset: str, xgb_score: float, p_value: float,
+                         exit_threshold: float, status_color: str,
+                         tf: str, leverage: int, is_p100: bool) -> go.Figure:
+    """Circular gauge for one position's XGB signal health."""
+    bar_color = {"red": "#ef4444", "yellow": "#f59e0b"}.get(status_color, "#10b981")
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=xgb_score,
+        number={"font": {"size": 26, "color": "#e2e8f0"}},
+        title={"text": f"<b>{asset}</b> ({tf} {leverage}x)",
+               "font": {"size": 13, "color": "#94a3b8"}},
+        gauge={
+            "axis": {"range": [0, 1], "tickwidth": 1, "tickcolor": "#334155",
+                     "tickfont": {"color": "#64748b", "size": 9}},
+            "bar": {"color": bar_color, "thickness": 0.7},
+            "bgcolor": "#1e293b",
+            "borderwidth": 0,
+            "steps": [
+                {"range": [0, exit_threshold], "color": "rgba(69,10,10,0.19)"},
+                {"range": [exit_threshold, 0.5], "color": "rgba(69,26,3,0.19)"},
+                {"range": [0.5, 1], "color": "rgba(6,78,59,0.19)"},
+            ],
+            "threshold": {
+                "line": {"color": "#f87171", "width": 3},
+                "thickness": 0.8, "value": exit_threshold,
+            },
+        },
+    ))
+    label = "P100 (Max)" if is_p100 else f"P{p_value:.0f}"
+    fig.add_annotation(text=f"<b>{label}</b>", x=0.5, y=0.18,
+                       showarrow=False, font={"size": 12, "color": bar_color})
+    fig.update_layout(height=210, margin=dict(t=48, b=8, l=28, r=28),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      font={"color": "#e2e8f0"})
+    return fig
+
+
+def render_signal_health(state: dict, prices: dict):
+    """Full Signal Health Monitor tab — P-Matrix integrity, gauges, audit table, cooldowns."""
+    st.caption("Variable P-Matrix (1x/3x/5x) | Real-Time Percentile Tracking | "
+               "Statistical Exhaustion Detection")
+
+    positions = state.get("positions", {})
+    cooldowns = state.get("cooldowns", {})
+    distributions = _build_percentile_distributions()
+    trades_df = load_trades()
+
+    # ── Exit toast (recent P_FLOOR_EXIT) ──────────────────────────────
+    if not trades_df.empty and "exit_ts" in trades_df.columns and "exit_reason" in trades_df.columns:
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(minutes=5)
+        try:
+            ts_col = pd.to_datetime(trades_df["exit_ts"], utc=True, errors="coerce")
+            recent = trades_df[(ts_col >= cutoff) & (trades_df["exit_reason"] == "P_FLOOR_EXIT")]
+            for _, trade in recent.iterrows():
+                asset = trade.get("asset", "?")
+                pnl = trade.get("pnl_pct", 0.0)
+                tf = trade.get("best_tf", "?")
+                pnl_label = f"+{pnl:.2f}%" if pnl > 0 else f"{pnl:.2f}%"
+                result_word = "Profit Secured" if pnl > 0 else "Loss Limited"
+                st.markdown(
+                    f'<div class="toast-exit">'
+                    f'\U0001F3C1 <b>[{asset}]</b> Exit via Signal Exhaustion ({tf}) '
+                    f'&mdash; {pnl_label} &mdash; {result_word}</div>',
+                    unsafe_allow_html=True,
+                )
+        except Exception:
+            pass
+
+    if not positions:
+        st.info("No active positions. Signal health gauges will appear when trades are open.")
+        _render_sh_cooldowns(cooldowns)
+        _render_sh_tf_reference(distributions)
+        return
+
+    # ── Validate positions ────────────────────────────────────────────
+    validated = {asset: _validate_position(pos, distributions) for asset, pos in positions.items()}
+    decay_info = _check_signal_decay(positions)
+
+    # ── Integrity alerts ──────────────────────────────────────────────
+    for asset, vp in validated.items():
+        if "DATA_LAG" in vp["flags"]:
+            st.markdown(
+                f'<div class="sh-data-lag">'
+                f'\u26A0\uFE0F <b>{asset}USDT</b> &mdash; DATA_LAG: '
+                f'XGB or Pearson R score is missing/zero. '
+                f'Percentile values may be stale.</div>',
+                unsafe_allow_html=True,
+            )
+        if "ZERO_FLOOR" in vp["flags"]:
+            st.markdown(
+                f'<div class="sh-zero-floor">'
+                f'\U0001F534 <b>{asset}USDT</b> &mdash; ZERO P-FLOOR: '
+                f'Exit protection is 0.000. Legacy position without P-Matrix guard.</div>',
+                unsafe_allow_html=True,
+            )
+
+    for asset, di in decay_info.items():
+        if di["decaying"]:
+            st.markdown(
+                f'<div class="sh-data-lag">'
+                f'\u26A1 <b>{asset}USDT</b> &mdash; SIGNAL DECAY: '
+                f'XGB dropped {di["drop"]:.4f} in {DECAY_WINDOW_MINUTES}min '
+                f'({di["peak"]:.4f} &rarr; {di["current"]:.4f}). '
+                f'Trend reversal risk.</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Signal Health Gauges ──────────────────────────────────────────
+    st.markdown("#### :dart: Signal Health Gauges")
+    gauge_cols = st.columns(min(len(validated), 4))
+    for i, (asset, vp) in enumerate(validated.items()):
+        col = gauge_cols[i % len(gauge_cols)]
+        with col:
+            fig = _render_health_gauge(
+                asset=asset, xgb_score=vp.get("xgb_prob", 0),
+                p_value=vp["p_value"], exit_threshold=vp["exit_threshold_actual"],
+                status_color=vp["status_color"], tf=vp.get("best_tf", "?"),
+                leverage=vp["matrix"].get("leverage", 0), is_p100=vp["is_p100"],
+            )
+            st.plotly_chart(fig, use_container_width=True, key=f"shg_{asset}")
+            badge = f"sh-badge-{vp['status_color']}"
+            st.markdown(
+                f'<div style="text-align:center;">'
+                f'<span class="{badge}">{vp["status"]}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("---")
+
+    # ── Live Audit Table ──────────────────────────────────────────────
+    st.markdown("#### :clipboard: Live Audit Table")
+    rows_html = []
+    for asset, vp in validated.items():
+        tf = vp.get("best_tf", "?")
+        lev = vp["matrix"].get("leverage", 0)
+        xgb = vp.get("xgb_prob", 0)
+        r_score = vp.get("confidence", 0)
+        p_val = vp["p_value"]
+        p_floor = vp.get("p_exit_threshold", 0)
+        status = vp["status"]
+        sc = vp["status_color"]
+        direction = "LONG" if vp.get("direction", 0) == 1 else "SHORT"
+        entry_price = vp.get("entry_price", 0)
+
+        live_price = prices.get(f"{asset}USDT", 0)
+        if live_price > 0 and entry_price > 0:
+            dir_mult = 1 if vp.get("direction", 0) == 1 else -1
+            unrealized = (live_price - entry_price) / entry_price * dir_mult * 100
+            pnl_str = f"{unrealized:+.2f}%"
+            pnl_color = "#10b981" if unrealized >= 0 else "#ef4444"
+        else:
+            pnl_str, pnl_color = "—", "#64748b"
+
+        badge = f"sh-badge-{sc}"
+        p_label = "P100 (Max)" if vp["is_p100"] else f"P{p_val:.0f}"
+
+        if vp["has_data_lag"]:
+            xgb_display = '<span style="color:#fbbf24;">\u26A0\uFE0F N/A</span>'
+            r_display = '<span style="color:#fbbf24;">\u26A0\uFE0F N/A</span>'
+        else:
+            xgb_display = f"{xgb:.4f}"
+            r_display = f"{r_score:.4f}"
+
+        if vp["has_zero_floor"]:
+            floor_display = '<span style="color:#f87171; font-weight:700;">0.000 \u26A0\uFE0F</span>'
+        else:
+            floor_display = f"{p_floor:.4f}"
+
+        di = decay_info.get(asset, {})
+        decay_class = ' class="decay-flash"' if di.get("decaying") else ""
+
+        rows_html.append(f"""
+        <tr{decay_class}>
+            <td><b>{asset}USDT</b><br>
+                <span style="color:#64748b;font-size:0.75rem;">{direction}</span></td>
+            <td>{tf}</td>
+            <td><b>{lev}x</b></td>
+            <td>{xgb_display}</td>
+            <td>{r_display}</td>
+            <td><b>{p_label}</b></td>
+            <td>{floor_display}</td>
+            <td style="color:{pnl_color};">{pnl_str}</td>
+            <td><span class="{badge}">{status}</span></td>
+        </tr>""")
+
+    st.markdown(f"""
+    <table class="audit-table">
+        <thead><tr>
+            <th>Symbol</th><th>TF</th><th>Leverage</th>
+            <th>Current XGB</th><th>Current R</th><th>P-Value</th>
+            <th>P-Exit Floor</th><th>Unrealized</th><th>Status</th>
+        </tr></thead>
+        <tbody>{"".join(rows_html)}</tbody>
+    </table>
+    """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Cooldown + Reference ──────────────────────────────────────────
+    _render_sh_cooldowns(cooldowns)
+    st.markdown("---")
+    _render_sh_tf_reference(distributions)
+
+
+def _render_sh_cooldowns(cooldowns: dict):
+    """Cooldown tracker section for Signal Health tab."""
+    st.markdown("#### :red_circle: Cooldown Tracker (Mola)")
+    now = datetime.now(timezone.utc)
+    active_cds = []
+    for asset, cd in cooldowns.items():
+        until_str = cd.get("cooldown_until", "")
+        losses = cd.get("consecutive_losses", 0)
+        if not until_str:
+            continue
+        try:
+            until = datetime.fromisoformat(until_str)
+            if now < until:
+                remaining = until - now
+                mins_left = int(remaining.total_seconds() / 60)
+                secs_left = int(remaining.total_seconds() % 60)
+                step = [15, 45, 180][min(losses, 3) - 1] if losses > 0 else 0
+                active_cds.append({
+                    "asset": asset, "losses": losses,
+                    "mins_left": mins_left, "secs_left": secs_left,
+                    "step_minutes": step,
+                    "until": until.strftime("%H:%M:%S UTC"),
+                })
+        except (ValueError, TypeError):
+            continue
+
+    if not active_cds:
+        st.markdown(
+            '<div style="text-align:center; color:#64748b; padding:16px;">'
+            'No assets on cooldown</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    for cd in active_cds:
+        step_label = {15: "1st Loss (15m)", 45: "2nd Loss (45m)",
+                      180: "3rd+ Loss (3h)"}.get(cd["step_minutes"], f"{cd['step_minutes']}m")
+        st.markdown(f"""
+        <div style="background:#1e2235; border-left:4px solid #ef4444; border-radius:8px;
+                    padding:14px 18px; margin-bottom:10px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div>
+                    <span style="color:#f87171; font-weight:700; font-size:1.05rem;">
+                        \U0001F534 {cd['asset']}USDT
+                    </span>
+                    <span class="sh-badge-red" style="margin-left:8px;">
+                        Streak: {cd['losses']}/3
+                    </span>
+                    <span class="sh-badge-gray" style="margin-left:6px;">{step_label}</span>
+                </div>
+                <div class="cd-timer">{cd['mins_left']:02d}:{cd['secs_left']:02d}</div>
+            </div>
+            <div style="color:#94a3b8; font-size:0.82rem; margin-top:6px;">
+                Resumes at {cd['until']} &mdash;
+                Market structure currently incompatible with signal math
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+
+def _render_sh_tf_reference(distributions: dict):
+    """TF-Matrix reference table with live percentile thresholds."""
+    st.markdown("#### :triangular_ruler: TF-Matrix Reference")
+    ref_data = []
+    for tf in ["5m", "30m", "1h", "4h"]:
+        m = TF_MATRIX[tf]
+        entry_t = _get_pmatrix_threshold(distributions, tf, m["entry_p"])
+        exit_t = _get_pmatrix_threshold(distributions, tf, m["exit_p"])
+        n_trades = len(distributions.get(tf, []))
+        ref_data.append({
+            "TF": tf, "Leverage": f"{m['leverage']}x",
+            "Entry Gate": f"P{m['entry_p']*100:.0f} = {entry_t:.4f}",
+            "Exit Floor": f"P{m['exit_p']*100:.0f} = {exit_t:.4f}",
+            "Distribution": f"{n_trades} trades",
+        })
+    st.dataframe(pd.DataFrame(ref_data), use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     with st.sidebar:
         st.markdown("### :lizard: Varanus Neo-Flow")
-        st.caption("Extended Dashboard v2.0 — 5m WS Scan")
-        st.markdown("33 assets | 3 groups | 4 TFs + 5m WS")
+        st.caption("Extended Dashboard v2.0 — Hourly")
+        st.markdown("33 assets | 3 groups | 4 TFs (Hourly Scan)")
         st.markdown("---")
 
         if st.button("Refresh Now", use_container_width=True):
@@ -2033,7 +2330,7 @@ def main():
 
         if pid:
             st.markdown(":green_circle: **Bot Running**")
-            st.markdown(":antenna_bars: **5m WS + Hourly Scans**")
+            st.markdown(":clock1: **Hourly Scan Frequency**")
         else:
             st.markdown(":red_circle: **Bot Stopped**")
         if state.get("circuit_breaker"):
@@ -2053,16 +2350,6 @@ def main():
                 if count:
                     st.markdown(f'{group_badge(g)} **{count}** open', unsafe_allow_html=True)
 
-            # Scan source breakdown
-            st.markdown("---")
-            st.caption("Open by Scan Source")
-            n_5m_sb = sum(1 for p in positions.values() if p.get("best_tf") == "5m")
-            n_htf_sb = len(positions) - n_5m_sb
-            if n_5m_sb:
-                st.markdown(f'<span style="color:#f6c343">WS-5m:</span> **{n_5m_sb}**', unsafe_allow_html=True)
-            if n_htf_sb:
-                st.markdown(f'<span style="color:#39afd1">Hourly:</span> **{n_htf_sb}**', unsafe_allow_html=True)
-
     state = load_bot_state()
     prices = fetch_binance_prices()
     scan_log = load_scan_log()
@@ -2070,10 +2357,11 @@ def main():
     wfv = load_wfv()
 
     st.markdown("## :lizard: Varanus Neo-Flow Extended Dashboard")
-    st.caption("33 assets | Groups A (Majors) / B (Tech-AI) / C (Meme) | 4 TFs + 5m WebSocket Scan")
+    st.caption("33 assets | Groups A (Majors) / B (Tech-AI) / C (Meme) | 4 TFs (Hourly Scan Cycle)")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         ":dart: Cockpit",
+        ":dna: Signal Health",
         ":brain: Decision Intelligence",
         ":chart_with_upwards_trend: Charting",
         ":bar_chart: Analytics",
@@ -2081,43 +2369,20 @@ def main():
         ":zap: Controls",
     ])
 
-    @st.fragment(run_every=1.0)
-    def fast_cockpit():
-        # Load fresh data inside fragment for true real-time
-        f_state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-        f_prices = fetch_binance_prices()
-        render_cockpit(f_state, f_prices)
-
-    @st.fragment(run_every=1.0)
-    def fast_intelligence():
-        # Load fresh data inside fragment for true real-time
-        f_state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-        f_log = json.loads(SCAN_LOG_FILE.read_text()) if SCAN_LOG_FILE.exists() else {}
-        render_intelligence(f_state, f_log)
-        st.markdown("---")
-        _render_bot_scan_log(f_log)
-
-
     with tab1:
-        fast_cockpit()
+        render_cockpit(state, prices)
     with tab2:
-        fast_intelligence()
+        render_signal_health(state, prices)
     with tab3:
-        render_charting(state, trades_df)
+        render_intelligence(state, scan_log)
     with tab4:
-        render_analytics(state, trades_df, wfv)
+        render_charting(state, trades_df)
     with tab5:
-        render_trade_history(trades_df)
+        render_analytics(state, trades_df, wfv)
     with tab6:
+        render_trade_history(trades_df)
+    with tab7:
         render_controls(state)
-
-    # Sidebar Footer / Auto-Refresh (Reduced for general UI)
-    st.sidebar.markdown("---")
-    st.sidebar.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
-    do_refresh = st.sidebar.checkbox("Auto Refresh (Slow)", value=False)
-    if do_refresh:
-        time.sleep(30)
-        st.rerun()
 
 
 if __name__ == "__main__":

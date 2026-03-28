@@ -1,0 +1,121 @@
+{
+  "description": "Varanus Neo-Flow Extended v1 — Standalone Configuration",
+  "version": "1.0.0",
+
+  "groups": {
+    "A": {
+      "name": "Majors",
+      "focus": "Stability / High Pearson R",
+      "assets": ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "LINK", "DOT", "LTC", "BCH", "TRX"],
+      "thresholds": {
+        "min_confidence": 0.75,
+        "min_xgb_score": 0.45,
+        "trail_buffer": 1.0,
+        "min_pvt_r": 0.65,
+        "combined_gate": 0.80,
+        "hard_sl_mult": 3.25,
+        "exhaust_r": 0.45,
+        "pos_frac": 0.07
+      }
+    },
+    "B": {
+      "name": "Tech & AI",
+      "focus": "Volume Synergy",
+      "assets": ["FET", "RENDER", "NEAR", "AR", "GRT", "INJ", "THETA", "FIL", "ATOM", "ICP", "STX"],
+      "thresholds": {
+        "min_confidence": 0.91,
+        "min_xgb_score": 0.55,
+        "trail_buffer": 1.2,
+        "min_pvt_r": 0.75,
+        "combined_gate": 0.85,
+        "hard_sl_mult": 2.50,
+        "exhaust_r": 0.55,
+        "pos_frac": 0.06
+      }
+    },
+    "C": {
+      "name": "Momentum & Meme",
+      "focus": "Volatility / Momentum",
+      "assets": ["PEPE", "TIA", "WIF", "BONK", "SUI", "SEI", "APT", "SHIB", "DOGE", "FLOKI", "OP"],
+      "thresholds": {
+        "min_confidence": 0.84,
+        "min_xgb_score": 0.54,
+        "trail_buffer": 1.5,
+        "min_pvt_r": 0.80,
+        "combined_gate": 0.80,
+        "hard_sl_mult": 3.25,
+        "exhaust_r": 0.35,
+        "pos_frac": 0.07
+      }
+    }
+  },
+
+  "consensus_params": {
+    "min_pearson_r": 0.92,
+    "min_pvt_r": 0.65,
+    "combined_gate": 0.80,
+    "hard_sl_mult": 2.50,
+    "trail_buffer": 1.2,
+    "exhaust_r": 0.625,
+    "pos_frac": 0.03
+  },
+
+  "escalating_cooldown": {
+    "description": "Anti-churn logic: escalating per-asset cooldowns on consecutive losses",
+    "profit_reset_pct": 0.5,
+    "default_steps": {
+      "1st_loss_minutes": 15,
+      "2nd_loss_minutes": 45,
+      "3rd_loss_minutes": 180
+    },
+    "group_c_steps": {
+      "1st_loss_minutes": 5,
+      "2nd_loss_minutes": 15,
+      "3rd_loss_minutes": 180
+    }
+  },
+
+  "trail_protection": {
+    "description": "Prevent trail from being tighter than commission costs or triggering too early",
+    "min_trail_pct": 0.15,
+    "min_bars_before_trail": 3
+  },
+
+  "execution": {
+    "description": "Hybrid execution: MARKET for urgent exits, LIMIT for calculated exits",
+    "urgent_exit_reasons": ["HARD_SL_HIT", "ADAPTIVE_TRAIL_HIT"],
+    "calculated_exit_reasons": ["TREND_EXHAUSTION", "TIME_BARRIER"],
+    "limit_buffer_pct": 0.05,
+    "stop_limit_buffer_pct": 0.05
+  },
+
+  "risk": {
+    "max_concurrent_positions": 8,
+    "max_drawdown_pct": -15.0,
+    "high_vol_assets": ["ICP", "PEPE", "BONK", "WIF", "FLOKI", "SHIB"],
+    "high_vol_scalar": 0.75
+  },
+
+  "scan": {
+    "timeframes": ["5m", "30m", "1h", "4h"],
+    "htf_timeframe": "4h",
+    "period_min": 20,
+    "period_max": 200,
+    "max_bars_held": 200
+  },
+
+  "xgboost": {
+    "model_path": "models/meta_xgb.json",
+    "training_cutoff": "2025-11-01",
+    "features": ["confidence", "pvt_r", "best_tf_encoded", "best_period"]
+  },
+
+  "infrastructure": {
+    "state_file": "live_extended_v1_state.json",
+    "trades_file": "live_extended_v1_trades.csv",
+    "scan_log_file": "logs/scan_results_v1.json",
+    "lock_file": "live_extended_v1.lock",
+    "monitor_interval_seconds": 30,
+    "websocket_settlement_buffer_seconds": 15
+  }
+}

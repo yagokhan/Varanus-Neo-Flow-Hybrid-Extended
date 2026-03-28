@@ -1,144 +1,42 @@
 {
-  "trade_counter": 32,
-  "realized_pnl": -3.0117237026766412,
-  "initial_capital": 920.25349898,
-  "peak_equity": 1000.0,
+  "trade_counter": 163,
+  "realized_pnl": 151.97002814563,
+  "initial_capital": 915.96782686,
+  "peak_equity": 1067.93785500563,
   "circuit_breaker": false,
-  "last_scan_ts": "2026-03-28T08:56:57.953532+00:00",
-  "total_scans": 45,
+  "last_scan_ts": "2026-03-28T17:17:35.098944+00:00",
+  "total_scans": 147,
   "current_scanning_asset": "",
   "positions": {
-    "NEAR": {
-      "trade_id": 29,
-      "asset": "NEAR",
+    "FIL": {
+      "trade_id": 163,
+      "asset": "FIL",
       "group": "B",
-      "symbol": "NEARUSDT",
+      "symbol": "FILUSDT",
       "direction": -1,
-      "entry_price": 1.186,
-      "entry_ts": "2026-03-27T18:02:02.849445+00:00",
-      "hard_sl": 1.20379,
-      "trail_sl": 1.2109507287048453,
-      "midline": 1.166055685822634,
-      "std_dev": 0.012520064350668839,
-      "best_tf": "4h",
-      "best_period": 24,
-      "confidence": 0.9338712144074885,
-      "pvt_r": 0.9309417080513619,
-      "leverage": 5,
-      "position_usd": 276.076049694,
-      "quantity": 0.0,
-      "bars_held": 4,
-      "peak_r": 0.9496903594985405,
-      "order_id": "",
-      "sl_order_id": "",
-      "last_bar_ns": 1774684800000000000,
-      "xgb_prob": 0.40039750933647156,
-      "entry_commission": 0.0,
-      "p_entry_threshold": 0.26840599477291105,
-      "p_exit_threshold": 0.1235215213149786,
-      "matrix_leverage": 5
-    },
-    "SEI": {
-      "trade_id": 31,
-      "asset": "SEI",
-      "group": "C",
-      "symbol": "SEIUSDT",
-      "direction": -1,
-      "entry_price": 0.0548,
-      "entry_ts": "2026-03-28T00:02:06.108586+00:00",
-      "hard_sl": 0.055622,
-      "trail_sl": 0.054882200000000006,
-      "midline": 0.0538300360389319,
-      "std_dev": 0.005178273040271043,
-      "best_tf": "30m",
-      "best_period": 51,
-      "confidence": 0.9800494104149159,
-      "pvt_r": 0.9330939902233722,
-      "leverage": 3,
-      "position_usd": 193.2532347858,
-      "quantity": 0.0,
-      "bars_held": 17,
-      "peak_r": 0.9800494104149159,
-      "order_id": "",
-      "sl_order_id": "",
-      "last_bar_ns": 1774686600000000000,
-      "xgb_prob": 0.7233434319496155,
-      "entry_commission": 0.0,
-      "p_entry_threshold": 0.6756521463394165,
-      "p_exit_threshold": 0.43581318855285645,
-      "matrix_leverage": 3
-    },
-    "TIA": {
-      "trade_id": 32,
-      "asset": "TIA",
-      "group": "C",
-      "symbol": "TIAUSDT",
-      "direction": -1,
-      "entry_price": 0.2971,
-      "entry_ts": "2026-03-28T02:02:09.722044+00:00",
-      "hard_sl": 0.30155649999999995,
-      "trail_sl": 0.30315554135946077,
-      "midline": 0.2951794996490641,
-      "std_dev": 0.008305096028678944,
+      "entry_price": 0.826,
+      "entry_ts": "2026-03-28T16:02:05.448225+00:00",
+      "hard_sl": 0.8367142857142856,
+      "trail_sl": 0.826,
+      "midline": 0.8079979702204643,
+      "std_dev": 0.00923928132354826,
       "best_tf": "1h",
-      "best_period": 64,
-      "confidence": 0.9721205392187844,
-      "pvt_r": 0.9107386529965138,
+      "best_period": 78,
+      "confidence": 0.9781137967308061,
+      "pvt_r": 0.9025715258535373,
       "leverage": 5,
-      "position_usd": 322.088724643,
+      "position_usd": 274.79034805799995,
       "quantity": 0.0,
-      "bars_held": 6,
-      "peak_r": 0.9730564473485115,
+      "bars_held": 1,
+      "peak_r": 0.9781137967308061,
       "order_id": "",
       "sl_order_id": "",
-      "last_bar_ns": 1774684800000000000,
-      "xgb_prob": 0.6080264449119568,
+      "last_bar_ns": 1774717200000000000,
+      "xgb_prob": 0.6799322366714478,
       "entry_commission": 0.0,
-      "p_entry_threshold": 0.607629805803299,
-      "p_exit_threshold": 0.33252231031656265,
+      "p_entry_threshold": 0,
+      "p_exit_threshold": 0,
       "matrix_leverage": 5
-    }
-  },
-  "cooldowns": {
-    "ATOM": {
-      "consecutive_losses": 5,
-      "cooldown_until": ""
-    },
-    "DOT": {
-      "consecutive_losses": 2,
-      "cooldown_until": ""
-    },
-    "NEAR": {
-      "consecutive_losses": 4,
-      "cooldown_until": ""
-    },
-    "OP": {
-      "consecutive_losses": 4,
-      "cooldown_until": ""
-    },
-    "BTC": {
-      "consecutive_losses": 1,
-      "cooldown_until": ""
-    },
-    "XRP": {
-      "consecutive_losses": 1,
-      "cooldown_until": ""
-    },
-    "ICP": {
-      "consecutive_losses": 3,
-      "cooldown_until": "2026-03-28T11:10:03.601016+00:00"
-    },
-    "STX": {
-      "consecutive_losses": 2,
-      "cooldown_until": ""
-    },
-    "SEI": {
-      "consecutive_losses": 0,
-      "cooldown_until": ""
-    },
-    "BNB": {
-      "consecutive_losses": 1,
-      "cooldown_until": ""
     }
   }
 }

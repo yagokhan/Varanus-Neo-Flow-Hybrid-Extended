@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """
-live_extended_v1.py — Varanus Neo-Flow Extended: TF-Based Percentile Execution Engine.
+live_extended_v1.py — Varanus Neo-Flow Extended: Pure XGB-Percentile Execution Engine.
 
-Timeframe-Specific Dynamic Percentile Optimization — risk scales with TF reliability.
+Entry decisions are made SOLELY by XGBoost percentile rank against historical distributions.
+No physics gates (RSI, EMA, PVT, Pearson R, HTF bias, combined gate) are used for entry.
 
-TF Hierarchy (the only leverage/percentile authority):
-  5m:   1x leverage | P90 entry | P20 exit   — Ultra-selective, noise elimination
-  30m:  3x leverage | P80 entry | P20 exit   — Balanced risk, trend following
-  1h:   5x leverage | P75 entry | P15 exit   — High confidence, trend riding
-  4h:   5x leverage | P70 entry | P15 exit   — Macro moves, maximum patience
+TF Hierarchy:
+  5m:   1x leverage | XGB >= P90   — Ultra-selective, noise elimination
+  30m:  3x leverage | XGB >= P90   — Balanced risk, trend following
+  1h:   5x leverage | XGB >= P80   — High confidence, trend riding
+  4h:   5x leverage | XGB >= P80   — Macro moves, maximum patience
 
-Group A (Majors): 5m/30m forced to P90 entry regardless of TF default.
-LONG trades: require both XGBoost AND Pearson R above their P-thresholds.
-4h positions: real-time projection via 5m snapshots (no-lag exit policy).
+Hard Constraints:
+  - Maximum 8 open positions
+  - Hard Stop Loss: Fixed 1.5% for all entries
+  - No cooldowns between trades
+  - XGB data missing/NA → do NOT enter
+  - Percentiles clamped at P100
 
 Core logic:
-  1. Entry gate:  XGB score >= entry_p percentile for the signal's best_tf
-  2. Exit gate:   XGB score < exit_p percentile → immediate MARKET close (Mathematical Exhaustion)
-  3. Leverage:    Strictly TF-based (1x/3x/5x) — NOT group-based
-  4. Hard SL:     Global 1.5% per position — overrides P-Floor if hit first
-  5. Cooldown:    Escalating with 0.5% stress-test cost (15m/45m/3h)
+  1. Entry gate:  XGB score >= entry_p percentile (ONLY gate)
+  2. Exit gate:   XGB score < exit_p percentile → MARKET close (Mathematical Exhaustion)
+  3. Leverage:    Strictly TF-based (1x/3x/5x)
+  4. Hard SL:     Global 1.5% per position
 
 Classes:
   PercentileCalculator — Maps P-values to actual numerical thresholds from trade history
-  SignalAuditor        — Validates signals against physics gates + TF percentile entry gate
-  RiskEngine           — P-Floor exits (Mathematical Exhaustion), 1.5% hard SL, circuit breaker
-  CooldownManager      — Escalating cooldown with stress-test cost
+  SignalAuditor        — Pure XGB-Percentile entry gate
+  RiskEngine           — P-Floor exits, 1.5% hard SL, circuit breaker
   TradeManager         — Orchestrates scan → entry → 5min audit → exit lifecycle
 
 Usage:
@@ -167,42 +169,35 @@ HARD_SL_PCT = 0.015
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# THE BRAIN: TF-Based Leverage & Percentile Hierarchy
+# THE BRAIN: Pure XGB-Percentile Model
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Risk scales with TF reliability — NOT with asset group.
-# Lower TFs = more noise = tighter gate + lower leverage.
-# Higher TFs = stronger trends = more patience + higher leverage.
+# Entry is decided SOLELY by XGBoost percentile rank.
+# No physics gates, no Pearson R gates, no PVT, no HTF bias, no combined gate.
 #
-# v1 Extended Optimized (blind-test validated):
-#   5m:  1x leverage | P90 entry (ultra-selective) | P20 exit
-#   30m: 3x leverage | P80 entry                   | P20 exit
-#   1h:  5x leverage | P75 entry (balanced)         | P15 exit
-#   4h:  5x leverage | P70 entry (macro moves)      | P15 exit
+#   5m:  1x leverage | XGB >= P90
+#   30m: 3x leverage | XGB >= P90
+#   1h:  5x leverage | XGB >= P80
+#   4h:  5x leverage | XGB >= P80
 
 TF_MATRIX = {
     "5m":  {"entry_p": 0.90, "exit_p": 0.20, "leverage": 1},
-    "30m": {"entry_p": 0.80, "exit_p": 0.20, "leverage": 3},
-    "1h":  {"entry_p": 0.75, "exit_p": 0.15, "leverage": 5},
-    "4h":  {"entry_p": 0.70, "exit_p": 0.15, "leverage": 5},
+    "30m": {"entry_p": 0.90, "exit_p": 0.20, "leverage": 3},
+    "1h":  {"entry_p": 0.80, "exit_p": 0.15, "leverage": 5},
+    "4h":  {"entry_p": 0.80, "exit_p": 0.15, "leverage": 5},
 }
 
 
 def _get_matrix_params(group: str, tf: str) -> dict:
-    """Lookup TF_MATRIX for a timeframe. Group A forces P90 on 5m/30m."""
+    """Lookup TF_MATRIX for a timeframe. Pure percentile — no group overrides."""
     params = TF_MATRIX.get(tf)
     if params is None:
-        # 1h+ rule: anything above 1h gets the macro-trend treatment
-        params = {"entry_p": 0.70, "exit_p": 0.15, "leverage": 5}
-    params = dict(params)  # copy to avoid mutating TF_MATRIX
-    # Rule 2: Group A (Majors) — force P90 entry barrier on 5m and 30m
-    if group == "A" and tf in ("5m", "30m"):
-        params["entry_p"] = 0.90
-    return params
+        params = {"entry_p": 0.80, "exit_p": 0.15, "leverage": 5}
+    return dict(params)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Load Group-Specific Thresholds (physics gates — preserved from v1)
+# Load Group-Specific Thresholds (pos_frac + trail_buffer for exits only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -343,19 +338,6 @@ def tg_exhaustion_exit_notify(symbol: str, pnl_pct: float,
         f"\\| *Distance:* {e(f'{distance:.4f}')}\n"
         f"*Insight:* Trend momentum dissipated\\. "
         f"Profit secured via P\\-Exit\\."
-    )
-    tg_send(msg, parse_mode="MarkdownV2")
-
-
-def tg_cooldown_notify(symbol: str, loss_count: int, pause_minutes: int):
-    """Cooldown (Mola) alert — asset paused after stress-test loss."""
-    e = _mdv2
-    msg = (
-        f"\U0001F534 *ASSET ON COOLDOWN*\n"
-        f"*Symbol:* {e(symbol)} \\| *Loss Streak:* {e(loss_count)}/3\n"
-        f"*Action:* No trades for the next {e(pause_minutes)} mins\\.\n"
-        f"*Reason:* Market structure currently incompatible "
-        f"with signal math\\."
     )
     tg_send(msg, parse_mode="MarkdownV2")
 
@@ -683,16 +665,8 @@ class LivePosition:
 
 
 @dataclass
-class CooldownState:
-    consecutive_losses: int = 0
-    cooldown_until: str = ""
-    blacklist_until: str = ""  # 24h blacklist after 3rd consecutive loss
-
-
-@dataclass
 class LiveState:
     positions: dict[str, LivePosition] = field(default_factory=dict)
-    cooldowns: dict[str, CooldownState] = field(default_factory=dict)
     trade_counter: int = 0
     realized_pnl: float = 0.0
     initial_capital: float = 1000.0
@@ -714,7 +688,6 @@ def save_state(state: LiveState):
         "total_scans": state.total_scans,
         "current_scanning_asset": state.current_scanning_asset,
         "positions": {a: asdict(p) for a, p in state.positions.items()},
-        "cooldowns": {a: asdict(c) for a, c in state.cooldowns.items()},
     }
     STATE_FILE.write_text(json.dumps(data, indent=2, default=str))
 
@@ -737,9 +710,6 @@ def load_state() -> LiveState:
                 for fld in ("p_entry_threshold", "p_exit_threshold", "matrix_leverage"):
                     pos_data.setdefault(fld, 0)
                 state.positions[asset] = LivePosition(**pos_data)
-            for asset, cd_data in data.get("cooldowns", {}).items():
-                cd_data.setdefault("blacklist_until", "")
-                state.cooldowns[asset] = CooldownState(**cd_data)
         except Exception as e:
             logger.error("Failed to load state: %s", e)
     return state
@@ -755,14 +725,13 @@ class PercentileCalculator:
     TF is the sole authority — distributions are built per timeframe across
     all asset groups for maximum sample size.
 
-    Example: entry_p=0.80 for 5m → the 80th percentile of all XGB scores
+    Example: entry_p=0.90 for 5m → the 90th percentile of all XGB scores
     for trades entered on the 5m timeframe (regardless of asset group).
     """
 
     def __init__(self, xgb_model: xgb.XGBClassifier):
         self.xgb_model = xgb_model
         self._distributions: dict[str, np.ndarray] = {}  # key = "5m", "30m", etc.
-        self._r_distributions: dict[str, np.ndarray] = {}  # Pearson R distributions per TF
         self._build_distributions()
 
     def _find_trade_csvs(self) -> list[Path]:
@@ -845,20 +814,6 @@ class PercentileCalculator:
             else:
                 logger.info("  TF %s: only %d trades (< 10), will use global fallback", tf, len(scores))
 
-        # Build Pearson R distributions per TF (for LONG dual-gate confirmation)
-        for tf in SCAN_TIMEFRAMES:
-            mask = combined["best_tf"] == tf
-            r_scores = combined.loc[mask, "confidence"].values
-            if len(r_scores) >= 10:
-                self._r_distributions[tf] = np.sort(r_scores)
-                logger.info("  TF %s R-dist: %d trades | P70=%.4f P75=%.4f P80=%.4f P90=%.4f",
-                            tf, len(r_scores),
-                            np.percentile(r_scores, 70), np.percentile(r_scores, 75),
-                            np.percentile(r_scores, 80), np.percentile(r_scores, 90))
-        all_r = combined["confidence"].values
-        if len(all_r) >= 10:
-            self._r_distributions["GLOBAL"] = np.sort(all_r)
-
         # Global fallback (all TFs combined)
         all_scores = combined["xgb_score"].values
         if len(all_scores) >= 10:
@@ -889,177 +844,37 @@ class PercentileCalculator:
                         tf, percentile)
         return percentile
 
-    def get_r_threshold(self, tf: str, percentile: float) -> float:
-        """Get the Pearson R threshold at a given percentile for LONG dual-gate."""
-        if tf in self._r_distributions:
-            return float(np.percentile(self._r_distributions[tf], percentile * 100))
-        if "GLOBAL" in self._r_distributions:
-            return float(np.percentile(self._r_distributions["GLOBAL"], percentile * 100))
-        return percentile
-
     def score_to_percentile(self, tf: str, score: float) -> float:
-        """Convert an XGB score to its percentile rank (0-100) for a given TF."""
+        """Convert an XGB score to its percentile rank (0-100) for a given TF. Clamped at P100."""
         dist = self._distributions.get(tf)
         if dist is None:
             dist = self._distributions.get("GLOBAL")
         if dist is None or len(dist) == 0:
-            return score * 100
+            return min(score * 100, 100.0)
         idx = np.searchsorted(dist, score)
-        return (idx / len(dist)) * 100
+        return min((idx / len(dist)) * 100, 100.0)
 
     def get_entry_threshold(self, group: str, tf: str) -> float:
-        """Get the entry XGB threshold for a TF. Group A forces P90 on 5m/30m."""
+        """Get the entry XGB threshold for a TF (pure percentile, no group overrides)."""
         params = _get_matrix_params(group, tf)
         return self.get_threshold(tf, params["entry_p"])
 
     def get_exit_threshold(self, group: str, tf: str) -> float:
-        """Get the exit XGB threshold (P-Floor) for a TF. Group A forces P90 on 5m/30m."""
+        """Get the exit XGB threshold (P-Floor) for a TF."""
         params = _get_matrix_params(group, tf)
         return self.get_threshold(tf, params["exit_p"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CooldownManager — Escalating Cooldown with Stress-Test Cost
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class CooldownManager:
-    """
-    Adaptive recovery system for failed trades.
-
-    Stress-test cost: net_pnl_pct = pnl_pct - 0.5%
-    If net_pnl_pct <= 0:
-        1st loss → 15 min cooldown
-        2nd loss → 45 min cooldown
-        3rd+ loss → 180 min blacklist (reset after 24h or manual /reset)
-    If net_pnl_pct > 0.5%: reset loss counter (unless blacklisted)
-    """
-
-    STRESS_COST = 0.5  # percentage points
-    STEPS = [15, 45, 180]  # minutes: 1st, 2nd, 3rd+
-    BLACKLIST_HOURS = 24  # 3rd loss triggers 24h blacklist auto-reset
-
-    def __init__(self, state: LiveState):
-        self.state = state
-
-    def record_exit(self, asset: str, pnl_pct: float):
-        """Record a trade exit and update cooldown state."""
-        net_pnl_pct = pnl_pct - self.STRESS_COST
-
-        if asset not in self.state.cooldowns:
-            self.state.cooldowns[asset] = CooldownState()
-
-        cd = self.state.cooldowns[asset]
-
-        # Check if existing blacklist has expired (24h auto-reset)
-        if cd.blacklist_until:
-            try:
-                bl_until = datetime.fromisoformat(cd.blacklist_until)
-                if datetime.now(timezone.utc) >= bl_until:
-                    cd.consecutive_losses = 0
-                    cd.blacklist_until = ""
-                    cd.cooldown_until = ""
-                    logger.info("BLACKLIST EXPIRED: %s — 24h auto-reset", asset)
-            except (ValueError, TypeError):
-                cd.blacklist_until = ""
-
-        if net_pnl_pct > self.STRESS_COST:
-            # Profitable enough to reset counter (unless 24h blacklisted)
-            if not cd.blacklist_until:
-                cd.consecutive_losses = 0
-                cd.cooldown_until = ""
-                logger.info("COOLDOWN RESET: %s — net_pnl=%.2f%% > %.1f%% threshold",
-                            asset, net_pnl_pct, self.STRESS_COST)
-            return
-
-        if net_pnl_pct <= 0:
-            cd.consecutive_losses += 1
-            step_idx = min(cd.consecutive_losses, len(self.STEPS)) - 1
-            pause_minutes = self.STEPS[step_idx]
-            until = datetime.now(timezone.utc) + timedelta(minutes=pause_minutes)
-            cd.cooldown_until = until.isoformat()
-
-            # 3rd+ loss: set 24h blacklist (if not already blacklisted)
-            if cd.consecutive_losses >= 3 and not cd.blacklist_until:
-                bl_until = datetime.now(timezone.utc) + timedelta(hours=self.BLACKLIST_HOURS)
-                cd.blacklist_until = bl_until.isoformat()
-                logger.info("BLACKLIST SET: %s — 3rd loss, 24h blacklist until %s",
-                            asset, bl_until.strftime("%Y-%m-%d %H:%M UTC"))
-
-            step_name = ["1st", "2nd", "3rd+"][step_idx]
-            logger.info("COOLDOWN: %s — %s loss (streak=%d), pausing %d min until %s",
-                        asset, step_name, cd.consecutive_losses, pause_minutes,
-                        until.strftime("%H:%M UTC"))
-            tg_cooldown_notify(
-                symbol=f"{asset}USDT",
-                loss_count=cd.consecutive_losses,
-                pause_minutes=pause_minutes,
-            )
-
-    def is_on_cooldown(self, asset: str) -> tuple[bool, str]:
-        """Check if an asset is on cooldown or blacklisted. Returns (is_cooling, reason)."""
-        cd = self.state.cooldowns.get(asset)
-        if cd is None:
-            return False, ""
-
-        now = datetime.now(timezone.utc)
-
-        # Check 24h blacklist first (overrides regular cooldown)
-        if cd.blacklist_until:
-            try:
-                bl_until = datetime.fromisoformat(cd.blacklist_until)
-                if now < bl_until:
-                    remaining_h = (bl_until - now).total_seconds() / 3600
-                    return True, f"blacklisted {remaining_h:.1f}h (losses={cd.consecutive_losses})"
-                else:
-                    # Expired — auto-reset
-                    cd.consecutive_losses = 0
-                    cd.blacklist_until = ""
-                    cd.cooldown_until = ""
-                    logger.info("BLACKLIST EXPIRED: %s — 24h auto-reset (checked in is_on_cooldown)", asset)
-            except (ValueError, TypeError):
-                cd.blacklist_until = ""
-
-        # Check regular cooldown
-        if not cd.cooldown_until:
-            return False, ""
-
-        try:
-            until = datetime.fromisoformat(cd.cooldown_until)
-            if now < until:
-                remaining = (until - now).total_seconds() / 60
-                return True, f"cooldown {remaining:.0f}m (losses={cd.consecutive_losses})"
-            else:
-                cd.cooldown_until = ""
-                return False, ""
-        except (ValueError, TypeError):
-            cd.cooldown_until = ""
-            return False, ""
-
-    def reset_cooldown(self, asset: str):
-        """Manual reset of cooldown and blacklist for an asset."""
-        if asset in self.state.cooldowns:
-            cd = self.state.cooldowns[asset]
-            cd.consecutive_losses = 0
-            cd.cooldown_until = ""
-            cd.blacklist_until = ""
-            logger.info("MANUAL RESET: %s — cooldown and blacklist cleared", asset)
-            return True
-        return False
-
-    @property
-    def states(self) -> dict[str, CooldownState]:
-        return self.state.cooldowns
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SignalAuditor — Physics Gates + P-Matrix Sniper Gate
+# SignalAuditor — Pure XGB-Percentile Gate
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SignalAuditor:
     """
-    Validates candidate signals through two layers:
-      1. Physics gates (Pearson R, PVT, 4H bias, combined gate) — preserved
-      2. P-Matrix sniper gate: XGB score >= entry_p percentile threshold
+    Pure XGB-Percentile entry gate.
+    Generates a signal via regression scan, then the ONLY filter is:
+      XGB score >= TF-specific percentile threshold.
+    No physics gates, no Pearson R gate, no PVT, no HTF bias, no combined gate.
     """
 
     def __init__(self, xgb_model: xgb.XGBClassifier, percentile_calc: PercentileCalculator,
@@ -1069,76 +884,9 @@ class SignalAuditor:
         self.group_thresholds = group_thresholds
         self.consensus = consensus
 
-    def _apply_group_params(self, asset: str):
-        """Apply group-specific thresholds to engine globals before scanning."""
-        import neo_flow.adaptive_engine as ae
-        gt = self.group_thresholds.get(get_group(asset))
-        if gt:
-            ae.MIN_PEARSON_R = gt.min_confidence
-            ae.MIN_PVT_PEARSON_R = gt.min_pvt_r
-            ae.COMBINED_GATE_THRESHOLD = gt.combined_gate
-            ae.HARD_SL_ATR_MULT = gt.hard_sl_mult
-            ae.TRAIL_BUFFER_STD = gt.trail_buffer
-            ae.TREND_EXHAUST_R = gt.exhaust_r
-
-    def run_physics_gates(self, asset: str, scan_dfs: dict, df_4h,
-                          gt: GroupThresholds) -> tuple:
-        """
-        Run physics pipeline gates.
-        Returns (signal, near_miss_or_None, rejection_status).
-        """
-        group = get_group(asset)
-        best, all_results = find_best_regression(scan_dfs)
-        if not best:
-            return None, None, "no_regression"
-
-        abs_r = abs(best.pearson_r)
-        direction = 1 if best.slope < 0 else -1
-        min_r = gt.min_confidence if gt else self.consensus["min_pearson_r"]
-        dir_str = "LONG" if direction == 1 else "SHORT"
-
-        if abs_r < min_r:
-            return None, None, "weak_r"
-
-        best_df_7d = trim_to_7d(scan_dfs[best.timeframe], best.timeframe)
-        pvt = compute_pvt_regression(best_df_7d, best.period)
-        min_pvt_r = gt.min_pvt_r if gt else self.consensus["min_pvt_r"]
-        pvt_passes, pvt_reason = check_pvt_alignment(direction, abs_r, pvt, min_pvt_r)
-        pvt_r_val = abs(pvt.pearson_r) if pvt else 0.0
-
-        if not pvt_passes:
-            nm = {"asset": asset, "group": group, "dir": dir_str,
-                  "r": abs_r, "pvt_r": pvt_r_val, "tf": best.timeframe, "period": best.period,
-                  "rejected_at": "PVT", "detail": pvt_reason}
-            return None, nm, "pvt_rejected"
-
-        htf_bias = get_htf_bias(df_4h)
-        if htf_bias == 0:
-            nm = {"asset": asset, "group": group, "dir": dir_str,
-                  "r": abs_r, "pvt_r": pvt_r_val, "tf": best.timeframe, "period": best.period,
-                  "rejected_at": "HTF", "detail": "4H neutral"}
-            return None, nm, "htf_neutral"
-        if htf_bias != direction:
-            nm = {"asset": asset, "group": group, "dir": dir_str,
-                  "r": abs_r, "pvt_r": pvt_r_val, "tf": best.timeframe, "period": best.period,
-                  "rejected_at": "HTF", "detail": f"conflict (sig={direction}, htf={htf_bias})"}
-            return None, nm, "htf_conflict"
-
-        cg_thresh = gt.combined_gate if gt else self.consensus["combined_gate"]
-        if not check_combined_gate(direction, all_results, cg_thresh):
-            nm = {"asset": asset, "group": group, "dir": dir_str,
-                  "r": abs_r, "pvt_r": pvt_r_val, "tf": best.timeframe, "period": best.period,
-                  "rejected_at": "GATE", "detail": f"opposing >{cg_thresh:.2f}"}
-            return None, nm, "combined_gate_blocked"
-
-        signal = scan_asset(asset, scan_dfs, df_4h,
-                            min_pearson_r=min_r, min_pvt_r=min_pvt_r,
-                            combined_gate_threshold=cg_thresh, group=group)
-        return signal, None, "passed" if signal else "physics_rejected_final"
-
     def audit_entry(self, asset: str, signal, scan_dfs: dict, df_4h) -> dict:
         """
-        Full audit: physics gates + P-Matrix sniper gate.
+        Pure XGB-Percentile audit. Generate signal, check XGB >= P-entry.
 
         Returns dict:
             passed: bool
@@ -1151,19 +899,24 @@ class SignalAuditor:
             reason: str
         """
         group = get_group(asset)
-        gt = self.group_thresholds.get(group, DEFAULT_THRESHOLDS.get(group))
-        self._apply_group_params(asset)
+        _fail = {"passed": False, "signal": None, "xgb_prob": 0.0,
+                 "entry_threshold": 0.0, "exit_threshold": 0.0, "matrix_leverage": 0,
+                 "near_miss": None, "reason": ""}
 
-        signal_obj, near_miss, status = self.run_physics_gates(asset, scan_dfs, df_4h, gt)
+        # Step 1: Generate signal via scan_asset (regression + direction)
+        gt = self.group_thresholds.get(group, DEFAULT_THRESHOLDS.get(group))
+        min_r = gt.min_confidence if gt else 0.70
+        min_pvt_r = gt.min_pvt_r if gt else 0.60
+        cg_thresh = gt.combined_gate if gt else 0.70
+        signal_obj = scan_asset(asset, scan_dfs, df_4h,
+                                min_pearson_r=min_r, min_pvt_r=min_pvt_r,
+                                combined_gate_threshold=cg_thresh, group=group)
 
         if signal_obj is None:
-            return {
-                "passed": False, "signal": None, "xgb_prob": 0.0,
-                "entry_threshold": 0.0, "exit_threshold": 0.0, "matrix_leverage": 0,
-                "near_miss": near_miss, "reason": status,
-            }
+            _fail["reason"] = "no_signal"
+            return _fail
 
-        # Compute XGB probability
+        # Step 2: Compute XGB probability
         xgb_prob = predict_probability(
             self.xgb_model,
             confidence=signal_obj.confidence,
@@ -1172,7 +925,12 @@ class SignalAuditor:
             best_period=signal_obj.best_period,
         )
 
-        # P-Matrix sniper gate: XGB score must exceed entry_p percentile
+        # Data integrity: reject if XGB is NA or missing
+        if xgb_prob is None or np.isnan(xgb_prob):
+            _fail["reason"] = "xgb_na"
+            return _fail
+
+        # Step 3: P-Matrix gate — the ONLY entry filter
         entry_threshold = self.percentile_calc.get_entry_threshold(group, signal_obj.best_tf)
         exit_threshold = self.percentile_calc.get_exit_threshold(group, signal_obj.best_tf)
         matrix_params = _get_matrix_params(group, signal_obj.best_tf)
@@ -1182,10 +940,9 @@ class SignalAuditor:
             near_miss = {
                 "asset": asset, "group": group,
                 "dir": "LONG" if signal_obj.direction == 1 else "SHORT",
-                "r": round(signal_obj.confidence, 4), "pvt_r": round(signal_obj.pvt_r, 4),
                 "tf": signal_obj.best_tf, "period": signal_obj.best_period,
                 "rejected_at": "P-MATRIX",
-                "detail": f"XGB={xgb_prob:.4f} < entry_P{matrix_params['entry_p']*100:.0f}={entry_threshold:.4f}",
+                "detail": f"XGB={xgb_prob:.4f} < P{matrix_params['entry_p']*100:.0f}={entry_threshold:.4f}",
                 "xgb_prob": round(xgb_prob, 4),
             }
             return {
@@ -1194,30 +951,6 @@ class SignalAuditor:
                 "matrix_leverage": matrix_leverage, "near_miss": near_miss,
                 "reason": "p_matrix_rejected",
             }
-
-        # Rule 2: LONG Confirmation — both XGB AND Pearson R must be above their
-        # respective P-thresholds simultaneously to execute a LONG trade
-        if signal_obj.direction == 1:  # LONG
-            r_threshold = self.percentile_calc.get_r_threshold(
-                signal_obj.best_tf, matrix_params["entry_p"]
-            )
-            if signal_obj.confidence < r_threshold:
-                near_miss = {
-                    "asset": asset, "group": group, "dir": "LONG",
-                    "r": round(signal_obj.confidence, 4),
-                    "pvt_r": round(signal_obj.pvt_r, 4),
-                    "tf": signal_obj.best_tf, "period": signal_obj.best_period,
-                    "rejected_at": "LONG-R-GATE",
-                    "detail": (f"R={signal_obj.confidence:.4f} < "
-                               f"R_P{matrix_params['entry_p']*100:.0f}={r_threshold:.4f}"),
-                    "xgb_prob": round(xgb_prob, 4),
-                }
-                return {
-                    "passed": False, "signal": signal_obj, "xgb_prob": xgb_prob,
-                    "entry_threshold": entry_threshold, "exit_threshold": exit_threshold,
-                    "matrix_leverage": matrix_leverage, "near_miss": near_miss,
-                    "reason": "long_r_gate_rejected",
-                }
 
         return {
             "passed": True, "signal": signal_obj, "xgb_prob": xgb_prob,
@@ -1376,9 +1109,8 @@ class RiskEngine:
 class TradeManager:
     """
     Main trading orchestrator integrating:
-      - SignalAuditor for entry validation
+      - SignalAuditor for entry validation (pure XGB-Percentile)
       - RiskEngine for exit monitoring
-      - CooldownManager for recovery logic
       - Binance execution via ccxt
     """
 
@@ -1410,14 +1142,12 @@ class TradeManager:
         # Load XGBoost model
         self.xgb_model, _ = load_model(XGB_MODEL_PATH)
 
-        # Load physics thresholds
+        # Load group thresholds (pos_frac + trail_buffer for exits)
         self.consensus = _load_consensus_params()
         self.group_thresholds = _load_group_thresholds()
-        self._apply_consensus()
 
         # Initialize core components
         self.percentile_calc = PercentileCalculator(self.xgb_model)
-        self.cooldown_mgr = CooldownManager(self.state)
         self.signal_auditor = SignalAuditor(
             self.xgb_model, self.percentile_calc,
             self.group_thresholds, self.consensus,
@@ -1430,7 +1160,7 @@ class TradeManager:
 
         logger.info("TradeManager initialized — mode=%s, capital=$%.0f, assets=%d",
                      "LIVE" if live_mode else "DRY-RUN", self.state.initial_capital, len(ASSETS))
-        logger.info("TF-Based Percentile Engine active. Leverage is TF-only (not group-based).")
+        logger.info("Pure XGB-Percentile Engine active. No physics gates, no cooldowns.")
 
         # Log TF hierarchy thresholds
         for tf in ["5m", "30m", "1h", "4h"]:
@@ -1441,20 +1171,10 @@ class TradeManager:
                         tf, params["leverage"], params["entry_p"]*100, entry_t,
                         params["exit_p"]*100, exit_t)
 
-    def _apply_consensus(self):
-        """Patch adaptive_engine globals to consensus defaults."""
-        import neo_flow.adaptive_engine as ae
-        ae.MIN_PEARSON_R = self.consensus["min_pearson_r"]
-        ae.MIN_PVT_PEARSON_R = self.consensus["min_pvt_r"]
-        ae.COMBINED_GATE_THRESHOLD = self.consensus["combined_gate"]
-        ae.HARD_SL_ATR_MULT = self.consensus["hard_sl_mult"]
-        ae.TRAIL_BUFFER_STD = self.consensus["trail_buffer"]
-        ae.TREND_EXHAUST_R = self.consensus["exhaust_r"]
-
     # ── Trade Execution ────────────────────────────────────────────────────
 
     def _close_trade(self, pos: LivePosition, exit_price: float, reason: str):
-        """Finalize trade: close on exchange, compute PnL, log, send alert, update cooldown."""
+        """Finalize trade: close on exchange, compute PnL, log, send alert."""
         now = datetime.now(timezone.utc)
         actual_exit_price = exit_price
 
@@ -1502,9 +1222,6 @@ class TradeManager:
 
         self.state.realized_pnl += pnl_usd
         del self.state.positions[pos.asset]
-
-        # Update cooldown
-        self.cooldown_mgr.record_exit(pos.asset, net_pnl_pct)
         save_state(self.state)
 
         entry_dt = datetime.fromisoformat(pos.entry_ts)
@@ -1658,7 +1375,6 @@ class TradeManager:
         matrix_p = _get_matrix_params(group, signal.best_tf)
         entry = {
             "asset": asset, "group": group, "dir": dir_str,
-            "r": round(signal.confidence, 4), "pvt_r": round(signal.pvt_r, 4),
             "tf": signal.best_tf, "period": signal.best_period,
             "xgb_prob": round(xgb_prob, 4),
             "entry_p": f"P{matrix_p['entry_p']*100:.0f}={entry_threshold:.4f}",
@@ -1843,12 +1559,6 @@ class TradeManager:
                 scan_log["signals"].append({"asset": asset, "status": "max_positions"})
                 break
 
-            # Cooldown check
-            is_cd, cd_reason = self.cooldown_mgr.is_on_cooldown(asset)
-            if is_cd:
-                scan_log["signals"].append({"asset": asset, "status": "cooldown", "detail": cd_reason})
-                continue
-
             asset_data = all_data.get(asset)
             if not asset_data:
                 scan_log["signals"].append({"asset": asset, "status": "no_data"})
@@ -1859,7 +1569,7 @@ class TradeManager:
                 scan_log["signals"].append({"asset": asset, "status": "no_data"})
                 continue
 
-            # Full audit: physics gates + P-Matrix sniper gate
+            # Pure XGB-Percentile audit
             audit = self.signal_auditor.audit_entry(asset, None, scan_dfs, df_4h)
 
             if audit["near_miss"]:
@@ -1946,13 +1656,11 @@ class TradeManager:
             lines.append(f"\n\U0001F3AF *NEW ENTRIES \\({e(len(entries))}\\)*")
             for ent in entries:
                 _xgb = f"{ent['xgb_prob']:.4f}"
-                _r = f"{ent['r']:.4f}"
-                _pvt = f"{ent['pvt_r']:.4f}"
                 _sz = f"${ent['size']:,.0f}"
                 lines.append(
                     f"  *{e(ent['asset'])}* \\[{e(ent['group'])}\\] "
                     f"\\({e(ent['dir'])}\\) \\| {e(ent['tf'])} {e(ent['lev'])}x\n"
-                    f"    XGB: {e(_xgb)} \\| R: {e(_r)} \\| PVT: {e(_pvt)}\n"
+                    f"    XGB: {e(_xgb)} \\| {e(ent['entry_p'])}\n"
                     f"    @ {e(ent['price'])} \\| {e(_sz)}"
                 )
 
@@ -1986,113 +1694,30 @@ class TradeManager:
                     f"  Status: {status}"
                 )
 
-        # ── 4. REJECTED NOISE (grouped by reason) ──
+        # ── 4. REJECTED NOISE (below entry barrier) ──
         if near_misses:
-            # Group near misses by rejection reason
-            rejection_groups: dict[str, list] = {}
-            for nm in near_misses:
-                key = nm.get("rejected_at", "UNKNOWN")
-                detail = nm.get("detail", "")
-                # Build a human-readable reason key
-                if key == "HTF" and "neutral" in detail.lower():
-                    reason_key = "HTF_NEUTRAL"
-                elif key == "HTF" and "conflict" in detail.lower():
-                    reason_key = "HTF_CONFLICT"
-                elif key == "PVT":
-                    reason_key = "PVT_DIVERGENCE"
-                elif key == "P-MATRIX":
-                    reason_key = "P_MATRIX"
-                elif key == "LONG-R-GATE":
-                    reason_key = "LONG_R_GATE"
-                elif key == "GATE":
-                    reason_key = "COMBINED_GATE"
-                else:
-                    reason_key = key
-                if reason_key not in rejection_groups:
-                    rejection_groups[reason_key] = []
-                rejection_groups[reason_key].append(nm)
-
-            # Rejection reason labels and meanings
-            reason_labels = {
-                "HTF_NEUTRAL": (
-                    "\U0001F6E1 *REJECTED: HTF NEUTRAL \\(4H Sideways\\)*",
-                    "Trend strong on local TF, but 4H big picture is sideways\\. Stayed out for safety\\.",
-                ),
-                "HTF_CONFLICT": (
-                    "\U0001F6E1 *REJECTED: HTF CONFLICT \\(4H Opposes\\)*",
-                    "Signal direction conflicts with the 4H macro trend\\. No counter\\-trend trades\\.",
-                ),
-                "PVT_DIVERGENCE": (
-                    "\U0001F4C9 *REJECTED: VOLUME DIVERGENCE \\(PVT\\)*",
-                    "Price moving but Smart Money \\(Volume\\) not following\\. High fake\\-out risk\\.",
-                ),
-                "P_MATRIX": (
-                    "\U0001F4CA *REJECTED: BELOW ENTRY BARRIER \\(P\\-Matrix\\)*",
-                    "XGB score too low for the TF entry percentile\\. Signal quality insufficient\\.",
-                ),
-                "LONG_R_GATE": (
-                    "\U0001F512 *REJECTED: LONG R\\-GATE*",
-                    "LONG signal passed XGB but Pearson R below threshold\\. Dual\\-gate blocked\\.",
-                ),
-                "COMBINED_GATE": (
-                    "\u26A1 *REJECTED: OPPOSING SIGNAL*",
-                    "Strong opposing regression detected\\. Conflicting forces in the market\\.",
-                ),
-            }
-
             lines.append(f"\n\U0001F6AB *REJECTED NOISE \\({e(len(near_misses))}\\)*")
-            for reason_key, nm_group in rejection_groups.items():
-                label, meaning = reason_labels.get(reason_key, (
-                    f"\U0001F6E1 *REJECTED: {e(reason_key)}*",
-                    f"Did not pass the {e(reason_key)} filter\\.",
-                ))
-                assets_str = ", ".join(
-                    f"{nm['asset']}\\[{nm.get('group', '?')}\\]"
-                    for nm in nm_group
-                )
+            lines.append(
+                "\U0001F4CA *BELOW ENTRY BARRIER \\(P\\-Matrix\\)*\n"
+                "  _XGB score below TF\\-specific percentile threshold\\._"
+            )
+            for nm in near_misses:
+                _xgb_nm = f"{nm.get('xgb_prob', 0):.4f}"
                 lines.append(
-                    f"\n{label}\n"
-                    f"  Assets: {assets_str}\n"
-                    f"  _Why: {meaning}_"
+                    f"  {e(nm['asset'])}\\[{e(nm.get('group', '?'))}\\] "
+                    f"{e(nm['dir'])} \\| XGB: {e(_xgb_nm)} \\| {e(nm.get('detail', ''))}"
                 )
 
-            # ── 5. ALPHA OPPORTUNITY (best rejected) ──
-            best_nm = max(
-                near_misses,
-                key=lambda nm: nm.get("xgb_prob", 0) or nm.get("r", 0),
-            )
+            # ── 5. ALPHA OPPORTUNITY (closest to entry) ──
+            best_nm = max(near_misses, key=lambda nm: nm.get("xgb_prob", 0))
             best_xgb = best_nm.get("xgb_prob", 0)
-            best_r = best_nm.get("r", 0)
-            best_reason = best_nm.get("rejected_at", "?")
-            best_detail = best_nm.get("detail", "")
-            # Suggest what to watch for
-            watch_hints = {
-                "HTF": "4H candle to align with signal direction",
-                "PVT": "Volume to confirm price direction",
-                "P-MATRIX": "XGB score to climb above entry barrier",
-                "LONG-R-GATE": "Pearson R to exceed the P\\-threshold",
-                "GATE": "Opposing regression to weaken",
-            }
-            watch = watch_hints.get(best_reason, "conditions to improve")
+            _best_xgb_s = f"{best_xgb:.4f}"
             lines.append(
                 f"\n\U0001F48E *TOP SPEC:* {e(best_nm['asset'])} "
                 f"\\[{e(best_nm.get('group', '?'))}\\] {e(best_nm['dir'])} "
-                f"\\(P\\={e(best_nm.get('period', '?'))} \\| "
-                f"R\\={e(f'{best_r:.4f}')}\\)\n"
-                f"  Barrier: {e(best_reason)} \\- {e(best_detail)}\n"
-                f"  _Watch for: {watch}_"
+                f"\\| XGB: {e(_best_xgb_s)}\n"
+                f"  _Watch for: XGB score to climb above entry barrier_"
             )
-
-        # ── Cooldowns ──
-        cd_list = []
-        for a, cd in self.state.cooldowns.items():
-            is_cd, reason = self.cooldown_mgr.is_on_cooldown(a)
-            if is_cd:
-                cd_list.append((a, reason))
-        if cd_list:
-            lines.append(f"\n\U0001F6D1 *COOLDOWNS \\({e(len(cd_list))}\\)*")
-            for a, reason in cd_list:
-                lines.append(f"  {e(a)}: {e(reason)}")
 
         tg_send("\n".join(lines), parse_mode="MarkdownV2")
 
@@ -2150,11 +1775,6 @@ class TradeManager:
                 _done("max_positions")
                 return
 
-            is_cd, cd_reason = self.cooldown_mgr.is_on_cooldown(asset)
-            if is_cd:
-                _done("cooldown", cd_reason)
-                return
-
             asset_data = _cached_data.get(asset)
             if not asset_data:
                 _done("no_data")
@@ -2167,7 +1787,7 @@ class TradeManager:
                 _done("no_data")
                 return
 
-            # Full audit: physics + P-Matrix
+            # Pure XGB-Percentile audit
             audit = self.signal_auditor.audit_entry(asset, None, scan_dfs, df_4h)
 
             if not audit["passed"]:
@@ -2206,11 +1826,6 @@ class TradeManager:
                             p.confidence, p.xgb_prob, p.p_exit_threshold, p.leverage,
                             p.best_tf)
                            for a, p in self.state.positions.items()]
-            cd_snapshot = []
-            for a, cd in self.state.cooldowns.items():
-                is_cd, reason = self.cooldown_mgr.is_on_cooldown(a)
-                if is_cd:
-                    cd_snapshot.append((a, cd.consecutive_losses, reason))
 
         e = _mdv2
         pnl_emoji = "\U0001F4C8" if rpnl >= 0 else "\U0001F4C9"
@@ -2223,7 +1838,7 @@ class TradeManager:
             f"{pnl_emoji} *PnL:* {e(f'${rpnl:+,.2f}')}",
             f"*Drawdown:* {e(f'{dd:.2f}')}% \\| *Peak:* {e(f'${peak:,.2f}')}",
             f"\U0001F916 *BOT STATUS:* {e(n_open)} Positions Open / {e(MAX_CONCURRENT)} Max",
-            f"*Scans:* {e(scans)} \\| *Entry:* P90/P80/P75/P70",
+            f"*Scans:* {e(scans)} \\| *Entry:* P90/P90/P80/P80",
         ]
 
         # ── 2. ACTIVE BATTLES ──
@@ -2257,12 +1872,6 @@ class TradeManager:
                     f"\\({e(_exit_t_s)}\\) \\| HARD SL: \\-1\\.5%\n"
                     f"  Status: {status}"
                 )
-
-        # ── Cooldowns ──
-        if cd_snapshot:
-            lines.append(f"\n\U0001F6D1 *COOLDOWNS \\({e(len(cd_snapshot))}\\)*")
-            for a, losses, reason in cd_snapshot:
-                lines.append(f"  {e(a)} \\| streak: {e(losses)} \\- {e(reason)}")
 
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
         lines.append(f"\n{e(ts)}")
@@ -2385,35 +1994,11 @@ def start_telegram_listener(bot: TradeManager):
                             elif "/daily" in text:
                                 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                                 bot.send_daily_snapshot(target_date=today)
-                            elif text.startswith("/reset"):
-                                # Manual cooldown/blacklist reset: /reset ASSET
-                                parts = msg.get("text", "").split()
-                                if len(parts) >= 2:
-                                    asset_arg = parts[1].upper().replace("USDT", "")
-                                    with bot.lock:
-                                        if bot.cooldown_mgr.reset_cooldown(asset_arg):
-                                            save_state(bot.state)
-                                            tg_send(
-                                                f"\u2705 *MANUAL RESET*\n"
-                                                f"{_mdv2(asset_arg)}: cooldown and blacklist cleared\\.",
-                                                parse_mode="MarkdownV2",
-                                            )
-                                        else:
-                                            tg_send(
-                                                f"\u26A0\uFE0F {_mdv2(asset_arg)} has no active cooldown\\.",
-                                                parse_mode="MarkdownV2",
-                                            )
-                                else:
-                                    tg_send(
-                                        "\u26A0\uFE0F Usage: `/reset ASSET` \\(e\\.g\\. `/reset BTC`\\)",
-                                        parse_mode="MarkdownV2",
-                                    )
                             elif "/help" in text:
                                 tg_send(
                                     "\u2139\uFE0F *Commands:*\n"
                                     "/status \\- Bot status with P\\-Matrix info\n"
                                     "/daily \\- Today's performance snapshot\n"
-                                    "/reset ASSET \\- Manual cooldown/blacklist reset\n"
                                     "/help \\- Show this help",
                                     parse_mode="MarkdownV2",
                                 )
@@ -2564,13 +2149,12 @@ def main():
     _e = _mdv2
     _mode = "LIVE" if args.live else "DRY\\-RUN"
     tg_send(
-        f"\U0001F680 *v1 Extended Optimized Engine Started*\n"
+        f"\U0001F680 *v1 Pure XGB\\-Percentile Engine Started*\n"
         f"*Mode:* {_mode} \\| *Capital:* {_e(f'${args.capital:,.0f}')}\n"
         f"*Assets:* {_e(len(ASSETS))} \\| *Leverage:* 5m\\=1x 30m\\=3x 1h/4h\\=5x\n"
-        f"*Entry:* P90/P80/P75/P70 \\| *Exit:* P20/P20/P15/P15 \\+ 1\\.5% Hard SL\n"
-        f"*Group A:* P90 forced on 5m/30m \\| *LONG:* Dual\\-gate \\(XGB\\+R\\)\n"
-        f"*4h:* Real\\-time projection \\(no\\-lag\\) \\| *Zero\\-Floor:* Protected\n"
-        f"*Cooldown:* 15m/45m/180m\\+24h blacklist \\+ 0\\.5% stress cost\n"
+        f"*Entry:* 5m/30m\\=P90 \\| 1h/4h\\=P80 \\(XGB only\\)\n"
+        f"*Exit:* P20/P20/P15/P15 \\+ 1\\.5% Hard SL\n"
+        f"*No cooldowns* \\| *Max 8 positions*\n"
         f"*Next scan:* {_e(next_trigger.strftime('%H:%M UTC'))} \\({_e(wait_secs // 60)}m\\)",
         parse_mode="MarkdownV2",
     )

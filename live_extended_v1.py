@@ -1927,60 +1927,168 @@ class TradeManager:
         logger.info("Cycle complete — Equity: $%.2f | Open: %d/%d [%s] | PnL: $%.2f",
                      equity, n_open, MAX_CONCURRENT, grp_str, rpnl)
 
-        # Build scan report (MarkdownV2)
+        # ── Build Telegram Scan Report (MarkdownV2) ──
         e = _mdv2
-        pnl_emoji = "\U0001F7E2" if rpnl >= 0 else "\U0001F534"
+        pnl_emoji = "\U0001F4C8" if rpnl >= 0 else "\U0001F4C9"
+
+        # ── 1. THE PULSE (Header) ──
         lines = [
-            f"\U0001F50D *Scan \\#{e(scan_num)}* {e(now.strftime('%H:%M UTC'))}",
-            f"*Equity:* {e(f'${equity:,.2f}')} \\| {pnl_emoji} *PnL:* {e(f'${rpnl:+,.2f}')}",
-            f"*Open:* {e(n_open)}/{e(MAX_CONCURRENT)} \\[{e(grp_str)}\\]",
+            f"\U0001F50D *Scan \\#{e(scan_num)}* \\| {e(now.strftime('%H:%M UTC'))}",
+            f"\U0001F3E6 *EQUITY:* {e(f'${equity:,.2f}')} \\| "
+            f"{pnl_emoji} *PnL:* {e(f'${rpnl:+,.2f}')}",
+            f"\U0001F916 *BOT STATUS:* {e(n_open)} Positions Open / {e(MAX_CONCURRENT)} Max",
         ]
 
+        # ── 2. NEW ENTRIES ──
         if entries:
-            lines.append(f"\n\U0001F3AF *ENTRIES \\({e(len(entries))}\\)*")
+            lines.append(f"\n\U0001F3AF *NEW ENTRIES \\({e(len(entries))}\\)*")
             for ent in entries:
                 _xgb = f"{ent['xgb_prob']:.4f}"
                 _r = f"{ent['r']:.4f}"
                 _pvt = f"{ent['pvt_r']:.4f}"
                 _sz = f"${ent['size']:,.0f}"
                 lines.append(
-                    f"  *{e(ent['asset'])}* \\({e(ent['dir'])}\\)\n"
+                    f"  *{e(ent['asset'])}* \\[{e(ent['group'])}\\] "
+                    f"\\({e(ent['dir'])}\\) \\| {e(ent['tf'])} {e(ent['lev'])}x\n"
                     f"    XGB: {e(_xgb)} \\| R: {e(_r)} \\| PVT: {e(_pvt)}\n"
-                    f"    {e(ent['tf'])} {e(ent['lev'])}x \\| "
-                    f"{e(ent['price'])} \\| {e(_sz)}"
-                )
-        else:
-            lines.append(f"\nEntries: None")
-
-        if near_misses:
-            lines.append(f"\n\u26A0\uFE0F *NEAR MISSES \\({e(len(near_misses))}\\)*")
-            for nm in near_misses:
-                _nm_xgb = f"{nm['xgb_prob']:.4f}" if 'xgb_prob' in nm else ""
-                xgb_str = f" \\| XGB: {e(_nm_xgb)}" if _nm_xgb else ""
-                _nm_r = f"{nm['r']:.4f}"
-                lines.append(
-                    f"  *{e(nm['asset'])}* \\({e(nm['dir'])}\\){xgb_str}\n"
-                    f"    R: {e(_nm_r)} \\| {e(nm['tf'])}\n"
-                    f"    {e(nm['rejected_at'])}: {e(nm['detail'])}"
+                    f"    @ {e(ent['price'])} \\| {e(_sz)}"
                 )
 
+        # ── 3. ACTIVE POSITIONS: The Battlefield ──
         if pos_list:
-            lines.append(f"\n\U0001F4C8 *POSITIONS \\({e(len(pos_list))}\\)*")
+            lines.append(f"\n\u2694\uFE0F *ACTIVE BATTLES \\({e(len(pos_list))}\\)*")
             for a, grp, d, ep, conf, xp, tf, per, lv, sz, exit_t in pos_list:
                 ds = "LONG" if d == 1 else "SHORT"
+                pctl = self.percentile_calc.score_to_percentile(tf, xp)
+                distance = xp - exit_t if exit_t > 0 else 0.0
+                matrix_p = _get_matrix_params(grp, tf)
+                # Dynamic status comment
+                if exit_t > 0 and xp < exit_t:
+                    status = "\u26A0\uFE0F Exhausted\\!"
+                elif exit_t > 0 and distance < 0.05:
+                    status = "\u26A0\uFE0F Approaching Exit\\!"
+                elif pctl >= 75:
+                    status = "\u2705 Strong"
+                elif pctl >= 50:
+                    status = "\U0001F7E1 Stable"
+                else:
+                    status = "\U0001F7E0 Weakening"
+                exit_p_label = f"{matrix_p['exit_p']*100:.0f}"
                 lines.append(
-                    f"  {e(a)} \\({e(ds)}\\) \\| {e(tf)} {e(lv)}x\n"
-                    f"    XGB: {e(f'{xp:.3f}')} \\| R: {e(f'{conf:.3f}')} \\| PFloor: {e(f'{exit_t:.3f}')}"
+                    f"\n  \u2694\uFE0F *{e(a)}* \\[{e(grp)}\\] \\({e(ds)}\\) "
+                    f"\\| TF: {e(tf)} \\| Lev: {e(lv)}x\n"
+                    f"  \U0001F9EC HEALTH: {e(f'{xp:.4f}')} \\| "
+                    f"PERCENTILE: P{e(f'{pctl:.0f}')}\n"
+                    f"  \U0001F6E1 EXIT FLOOR: P{e(exit_p_label)} "
+                    f"\\({e(f'{exit_t:.4f}')}\\) \\| HARD SL: \\-1\\.5%\n"
+                    f"  Status: {status}"
                 )
 
-        # Cooldown info
+        # ── 4. REJECTED NOISE (grouped by reason) ──
+        if near_misses:
+            # Group near misses by rejection reason
+            rejection_groups: dict[str, list] = {}
+            for nm in near_misses:
+                key = nm.get("rejected_at", "UNKNOWN")
+                detail = nm.get("detail", "")
+                # Build a human-readable reason key
+                if key == "HTF" and "neutral" in detail.lower():
+                    reason_key = "HTF_NEUTRAL"
+                elif key == "HTF" and "conflict" in detail.lower():
+                    reason_key = "HTF_CONFLICT"
+                elif key == "PVT":
+                    reason_key = "PVT_DIVERGENCE"
+                elif key == "P-MATRIX":
+                    reason_key = "P_MATRIX"
+                elif key == "LONG-R-GATE":
+                    reason_key = "LONG_R_GATE"
+                elif key == "GATE":
+                    reason_key = "COMBINED_GATE"
+                else:
+                    reason_key = key
+                if reason_key not in rejection_groups:
+                    rejection_groups[reason_key] = []
+                rejection_groups[reason_key].append(nm)
+
+            # Rejection reason labels and meanings
+            reason_labels = {
+                "HTF_NEUTRAL": (
+                    "\U0001F6E1 *REJECTED: HTF NEUTRAL \\(4H Sideways\\)*",
+                    "Trend strong on local TF, but 4H big picture is sideways\\. Stayed out for safety\\.",
+                ),
+                "HTF_CONFLICT": (
+                    "\U0001F6E1 *REJECTED: HTF CONFLICT \\(4H Opposes\\)*",
+                    "Signal direction conflicts with the 4H macro trend\\. No counter\\-trend trades\\.",
+                ),
+                "PVT_DIVERGENCE": (
+                    "\U0001F4C9 *REJECTED: VOLUME DIVERGENCE \\(PVT\\)*",
+                    "Price moving but Smart Money \\(Volume\\) not following\\. High fake\\-out risk\\.",
+                ),
+                "P_MATRIX": (
+                    "\U0001F4CA *REJECTED: BELOW ENTRY BARRIER \\(P\\-Matrix\\)*",
+                    "XGB score too low for the TF entry percentile\\. Signal quality insufficient\\.",
+                ),
+                "LONG_R_GATE": (
+                    "\U0001F512 *REJECTED: LONG R\\-GATE*",
+                    "LONG signal passed XGB but Pearson R below threshold\\. Dual\\-gate blocked\\.",
+                ),
+                "COMBINED_GATE": (
+                    "\u26A1 *REJECTED: OPPOSING SIGNAL*",
+                    "Strong opposing regression detected\\. Conflicting forces in the market\\.",
+                ),
+            }
+
+            lines.append(f"\n\U0001F6AB *REJECTED NOISE \\({e(len(near_misses))}\\)*")
+            for reason_key, nm_group in rejection_groups.items():
+                label, meaning = reason_labels.get(reason_key, (
+                    f"\U0001F6E1 *REJECTED: {e(reason_key)}*",
+                    f"Did not pass the {e(reason_key)} filter\\.",
+                ))
+                assets_str = ", ".join(
+                    f"{nm['asset']}\\[{nm.get('group', '?')}\\]"
+                    for nm in nm_group
+                )
+                lines.append(
+                    f"\n{label}\n"
+                    f"  Assets: {assets_str}\n"
+                    f"  _Why: {meaning}_"
+                )
+
+            # ── 5. ALPHA OPPORTUNITY (best rejected) ──
+            best_nm = max(
+                near_misses,
+                key=lambda nm: nm.get("xgb_prob", 0) or nm.get("r", 0),
+            )
+            best_xgb = best_nm.get("xgb_prob", 0)
+            best_r = best_nm.get("r", 0)
+            best_reason = best_nm.get("rejected_at", "?")
+            best_detail = best_nm.get("detail", "")
+            # Suggest what to watch for
+            watch_hints = {
+                "HTF": "4H candle to align with signal direction",
+                "PVT": "Volume to confirm price direction",
+                "P-MATRIX": "XGB score to climb above entry barrier",
+                "LONG-R-GATE": "Pearson R to exceed the P\\-threshold",
+                "GATE": "Opposing regression to weaken",
+            }
+            watch = watch_hints.get(best_reason, "conditions to improve")
+            lines.append(
+                f"\n\U0001F48E *TOP SPEC:* {e(best_nm['asset'])} "
+                f"\\[{e(best_nm.get('group', '?'))}\\] {e(best_nm['dir'])} "
+                f"\\(P\\={e(best_nm.get('period', '?'))} \\| "
+                f"R\\={e(f'{best_r:.4f}')}\\)\n"
+                f"  Barrier: {e(best_reason)} \\- {e(best_detail)}\n"
+                f"  _Watch for: {watch}_"
+            )
+
+        # ── Cooldowns ──
         cd_list = []
         for a, cd in self.state.cooldowns.items():
             is_cd, reason = self.cooldown_mgr.is_on_cooldown(a)
             if is_cd:
                 cd_list.append((a, reason))
         if cd_list:
-            lines.append(f"\n\U0001F534 *COOLDOWNS \\({e(len(cd_list))}\\)*")
+            lines.append(f"\n\U0001F6D1 *COOLDOWNS \\({e(len(cd_list))}\\)*")
             for a, reason in cd_list:
                 lines.append(f"  {e(a)}: {e(reason)}")
 
@@ -2103,30 +2211,57 @@ class TradeManager:
                     cd_snapshot.append((a, cd.consecutive_losses, reason))
 
         e = _mdv2
-        pnl_emoji = "\U0001F7E2" if rpnl >= 0 else "\U0001F534"
+        pnl_emoji = "\U0001F4C8" if rpnl >= 0 else "\U0001F4C9"
+
+        # ── 1. THE PULSE ──
         lines = [
             f"\U0001F4CB *Varanus Neo\\-Flow Extended*",
             f"*Mode:* {mode} \\| *CB:* {e(cb)}",
-            f"*Equity:* {e(f'${equity:,.2f}')} \\| {pnl_emoji} *PnL:* {e(f'${rpnl:+,.2f}')}",
+            f"\U0001F3E6 *EQUITY:* {e(f'${equity:,.2f}')} \\| "
+            f"{pnl_emoji} *PnL:* {e(f'${rpnl:+,.2f}')}",
             f"*Drawdown:* {e(f'{dd:.2f}')}% \\| *Peak:* {e(f'${peak:,.2f}')}",
-            f"*Open:* {e(n_open)}/{e(MAX_CONCURRENT)} \\| *Scans:* {e(scans)}",
-            f"*Entry:* P90/P80/P75/P70 \\| *Lev:* 1x/3x/5x/5x",
-            f"*Exit:* P20/P20/P15/P15 \\| *Hard SL:* 1\\.5%",
+            f"\U0001F916 *BOT STATUS:* {e(n_open)} Positions Open / {e(MAX_CONCURRENT)} Max",
+            f"*Scans:* {e(scans)} \\| *Entry:* P90/P80/P75/P70",
         ]
+
+        # ── 2. ACTIVE BATTLES ──
         if pos_snapshot:
-            lines.append("")
-            lines.append(f"\U0001F4C8 *Positions \\({e(len(pos_snapshot))}\\):*")
-            for asset, grp, direction, entry, sl, conf, xgb_p, exit_t, lev, tf in pos_snapshot:
+            lines.append(f"\n\u2694\uFE0F *ACTIVE BATTLES \\({e(len(pos_snapshot))}\\)*")
+            for asset, grp, direction, entry_px, sl, conf, xgb_p, exit_t, lev, tf in pos_snapshot:
                 dir_str = "LONG" if direction == 1 else "SHORT"
+                pctl = self.percentile_calc.score_to_percentile(tf, xgb_p)
+                distance = xgb_p - exit_t if exit_t > 0 else 0.0
+                matrix_p = _get_matrix_params(grp, tf)
+                if exit_t > 0 and xgb_p < exit_t:
+                    status = "\u26A0\uFE0F Exhausted\\!"
+                elif exit_t > 0 and distance < 0.05:
+                    status = "\u26A0\uFE0F Approaching Exit\\!"
+                elif pctl >= 75:
+                    status = "\u2705 Strong"
+                elif pctl >= 50:
+                    status = "\U0001F7E1 Stable"
+                else:
+                    status = "\U0001F7E0 Weakening"
+                exit_p_label = f"{matrix_p['exit_p']*100:.0f}"
+                _xgb_s = f"{xgb_p:.4f}"
+                _pctl_s = f"{pctl:.0f}"
+                _exit_t_s = f"{exit_t:.4f}"
                 lines.append(
-                    f"  {e(asset)} \\({e(dir_str)}\\) \\| {e(tf)} {e(lev)}x\n"
-                    f"    XGB: {e(f'{xgb_p:.3f}')} \\| R: {e(f'{conf:.3f}')} \\| PFloor: {e(f'{exit_t:.3f}')}"
+                    f"\n  \u2694\uFE0F *{e(asset)}* \\[{e(grp)}\\] \\({e(dir_str)}\\) "
+                    f"\\| TF: {e(tf)} \\| Lev: {e(lev)}x\n"
+                    f"  \U0001F9EC HEALTH: {e(_xgb_s)} \\| "
+                    f"PERCENTILE: P{e(_pctl_s)}\n"
+                    f"  \U0001F6E1 EXIT FLOOR: P{e(exit_p_label)} "
+                    f"\\({e(_exit_t_s)}\\) \\| HARD SL: \\-1\\.5%\n"
+                    f"  Status: {status}"
                 )
+
+        # ── Cooldowns ──
         if cd_snapshot:
-            lines.append("")
-            lines.append(f"\U0001F534 *Cooldowns \\({e(len(cd_snapshot))}\\):*")
+            lines.append(f"\n\U0001F6D1 *COOLDOWNS \\({e(len(cd_snapshot))}\\)*")
             for a, losses, reason in cd_snapshot:
                 lines.append(f"  {e(a)} \\| streak: {e(losses)} \\- {e(reason)}")
+
         ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
         lines.append(f"\n{e(ts)}")
         tg_send("\n".join(lines), parse_mode="MarkdownV2")

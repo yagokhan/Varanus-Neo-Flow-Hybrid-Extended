@@ -1,0 +1,11 @@
+{
+  "trade_counter": 163,
+  "realized_pnl": 0.0,
+  "initial_capital": 910.65024495,
+  "peak_equity": 1067.93785500563,
+  "circuit_breaker": false,
+  "last_scan_ts": "2026-03-29T09:52:14.476328+00:00",
+  "total_scans": 163,
+  "current_scanning_asset": "",
+  "positions": {}
+}
